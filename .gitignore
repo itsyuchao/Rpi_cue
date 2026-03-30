@@ -1,0 +1,30 @@
+# Audio files
+*.wav
+*.mp3
+*.ogg
+*.flac
+
+# ML/TTS models
+*.onnx
+*.onnx.json
+*.mdl
+*.fst
+*.dubm
+*.ie
+*.mat
+*.stats
+
+# Vosk models
+rpi_workshop/vosk_models/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
