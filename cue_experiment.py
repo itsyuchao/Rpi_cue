@@ -3,44 +3,47 @@
 cue_experiment.py
 =================
 Rhythmic cueing experiment controller for Raspberry Pi 4.
-Delivers sound (PCM5102A via I2S) and/or vibration (DRV2605L LRA via I2C)
-in structured 3-sub-block trials.
 
 Hardware
 --------
-  Sound : PCM5102A breakout → I2S (BCLK=GPIO18, LRCLK=GPIO19, DIN=GPIO21)
-          /boot/config.txt: dtoverlay=hifiberry-dac
-  Haptic: DRV2605L → I2C (SDA/SCL), LRA motor on Motor+/Motor-
+  Sound  : PCM5102A breakout → I2S (BCLK=GPIO18, LRCLK=GPIO19, DIN=GPIO21)
+  Haptic : DRV2605L → I2C 0x5a, LRA motor
+  LCD    : 16×2 I2C LCD → I2C 0x27 (lcd_i2c driver)
+  Keypad : 4×4 membrane → GPIO 23,24,25,8 (rows) / 7,1,12,16 (cols)
+
+Trial structure (4 sub-blocks × blocktime s each)
+--------------------------------------------------
+  'ready.wav' → pause → 'walk.wav' →
+  Block 1 — Arrhythmic  : random beats from 20 pre-generated templates
+  Block 2 — Silent      : no cue
+  Block 3 — Regular     : steady alternating cue at freq Hz
+  Block 4 — Silent      : no cue
+  → 'rest.wav', wait for continue
 
 Install
 -------
   pip install numpy sounddevice scipy \
               adafruit-blinka adafruit-circuitpython-drv2605
-
-Quick start
------------
-  python3 cue_experiment.py                        # defaults
-  python3 cue_experiment.py --randomize
-  python3 cue_experiment.py --firstblock vibration --blocknum 10
-  python3 cue_experiment.py --simtest              # run simultaneous test only
-
-API
----
-  generate_cue(blocknum=20, blocktime=15, preptime=2, freq=1,
-               randomize=False, firstblock='sound')
+  # lcd_i2c and gpiozero come with Raspberry Pi OS
 """
 
 import argparse
+import csv
+import os
 import random
-import sys
 import threading
 import time
+from datetime import datetime
 
 import numpy as np
 import sounddevice as sd
 import scipy.io.wavfile as wav
 
-# ── Optional haptic driver (graceful degradation on dev machines) ─────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Module 1 — Hardware imports (graceful fallback)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Haptic
 try:
     import board
     import busio
@@ -50,252 +53,405 @@ except ImportError:
     HAPTIC_AVAILABLE = False
     print("INFO: adafruit_drv2605 not found — haptic output disabled")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Audio constants
-# ─────────────────────────────────────────────────────────────────────────────
-SR         = 48000   # Hz — native rate for PCM5102A (no resampling in PipeWire)
-F_LOW      = 440.0    # A4
-F_HIGH     = 659.3    # E5 (perfect fifth above A4)
+# LCD
+try:
+    from lcd_i2c import LCD_I2C
+    LCD_AVAILABLE = True
+except ImportError:
+    LCD_AVAILABLE = False
+    print("INFO: lcd_i2c not found — LCD output disabled")
+
+# Keypad
+try:
+    from gpiozero import DigitalOutputDevice, Button
+    KEYPAD_AVAILABLE = True
+except ImportError:
+    KEYPAD_AVAILABLE = False
+    print("INFO: gpiozero not found — keypad input disabled")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Module 2 — Constants
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Audio synthesis
+SR         = 48000
+F_LOW      = 440.0      # A4
+F_HIGH     = 659.3      # E5
 AMPLITUDE  = 0.80
 ATTACK_MS  = 5
 RELEASE_MS = 20
+HARMONICS  = [(1, 1.00), (2, 0.30), (3, 0.15), (4, 0.10)]
+TONE_DUTY  = 0.3
 
-# Harmonic recipe — bright but pleasant timbre (same as twotone_precomputed.py)
-HARMONICS = [
-    (1, 1.00),   # fundamental
-    (2, 0.30),   # octave
-    (3, 0.15),   # fifth above octave
-    (4, 0.10),   # two octaves
+# Arrhythmic timing — both inter-pair AND intra-pair randomised
+ARHYTHM_ISI_MIN   = 0.35
+ARHYTHM_ISI_MAX   = 1.20
+ARHYTHM_INTRA_MIN = 0.08
+ARHYTHM_INTRA_MAX = 0.35
+
+# Templates
+NUM_TEMPLATES = 20
+
+# Haptic effects (DRV2605 built-in library)
+DEFAULT_EFFECT1 = 1    # Strong Click → "low" beat
+DEFAULT_EFFECT2 = 47   # Sharp Tick   → "high" beat
+
+# Keypad GPIO (left→right on ribbon: 23,24,25,8,7,1,12,16)
+KEYPAD_ROWS_PINS = [23, 24, 25, 8]
+KEYPAD_COLS_PINS = [7, 1, 12, 16]
+KEYPAD_KEYS = [
+    "1", "2", "3", "A",
+    "4", "5", "6", "B",
+    "7", "8", "9", "C",
+    "*", "0", "#", "D",
 ]
 
-TONE_DUTY = 0.3     # tone fills 30 % of each half-period; rest is silence
+# LCD
+LCD_I2C_ADDR = 0x27
+LCD_COLS     = 16
+LCD_ROWS     = 2
 
-# Arrhythmic ISI bounds (seconds between successive pair onsets)
-ARHYTHM_ISI_MIN = 0.35
-ARHYTHM_ISI_MAX = 1.20
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Haptic defaults (DRV2605L built-in library effects)
-# ─────────────────────────────────────────────────────────────────────────────
-DEFAULT_EFFECT1 = 1    # Strong Click  — maps to "low" beat (A4)
-DEFAULT_EFFECT2 = 47   # Sharp Tick    — maps to "high" beat (E5)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 1 — Audio helpers
+# Module 3 — LCD driver
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _find_hifiberry():
-    for i, dev in enumerate(sd.query_devices()):
-        if 'hifiberry' in dev['name'].lower():
-            return i
+_lcd = None
+
+
+def lcd_init():
+    """Initialise the 16×2 I2C LCD."""
+    global _lcd
+    if not LCD_AVAILABLE:
+        return
+    try:
+        _lcd = LCD_I2C(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS)
+        _lcd.backlight.on()
+        _lcd.clear()
+        print(f"LCD: 16x2 at I2C 0x{LCD_I2C_ADDR:02x}")
+    except Exception as e:
+        print(f"WARNING: LCD init failed — {e}")
+        _lcd = None
+
+
+def lcd_show(line1: str = "", line2: str = ""):
+    """Write two lines to LCD. Falls back to terminal if no LCD."""
+    if _lcd is None:
+        print(f"  LCD| {line1[:LCD_COLS]:<{LCD_COLS}}")
+        print(f"  LCD| {line2[:LCD_COLS]:<{LCD_COLS}}")
+        return
+    try:
+        _lcd.clear()
+        _lcd.cursor.setPos(0, 0)
+        _lcd.write_text(line1[:LCD_COLS].ljust(LCD_COLS))
+        _lcd.cursor.setPos(1, 0)
+        _lcd.write_text(line2[:LCD_COLS].ljust(LCD_COLS))
+    except Exception as e:
+        print(f"  LCD write error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Module 4 — Keypad driver
+# ══════════════════════════════════════════════════════════════════════════════
+
+_kp_rows = None
+_kp_cols = None
+
+
+def keypad_init():
+    """Initialise keypad GPIO pins."""
+    global _kp_rows, _kp_cols
+    if not KEYPAD_AVAILABLE:
+        return
+    if _kp_rows is not None:
+        return
+    _kp_rows = [DigitalOutputDevice(pin) for pin in KEYPAD_ROWS_PINS]
+    _kp_cols = [Button(pin, pull_up=False) for pin in KEYPAD_COLS_PINS]
+    print("Keypad: 4x4 matrix initialised")
+
+
+def keypad_scan() -> str | None:
+    """Single scan. Returns key char or None."""
+    if _kp_rows is None:
+        return None
+    for i, row in enumerate(_kp_rows):
+        row.on()
+        for j, col in enumerate(_kp_cols):
+            if col.is_pressed:
+                row.off()
+                return KEYPAD_KEYS[i * 4 + j]
+        row.off()
     return None
 
 
-def _setup_audio():
+def keypad_wait(timeout: float = None) -> str | None:
+    """Block until a key is pressed and released. Debounced."""
+    last = None
+    start = time.monotonic()
+    while True:
+        key = keypad_scan()
+        if key and key != last:
+            time.sleep(0.05)
+            if keypad_scan() == key:
+                while keypad_scan() == key:
+                    time.sleep(0.02)
+                return key
+        last = key
+        time.sleep(0.03)
+        if timeout and (time.monotonic() - start) > timeout:
+            return None
+
+
+def keypad_close():
+    """Release keypad GPIO."""
+    global _kp_rows, _kp_cols
+    if _kp_rows:
+        for r in _kp_rows:
+            r.close()
+        for c in _kp_cols:
+            c.close()
+    _kp_rows = None
+    _kp_cols = None
+
+
+def keypad_input_string(prompt: str = "Enter ID:",
+                        max_len: int = 12) -> str:
+    """
+    Collect a string via keypad + LCD.
+    0-9, A-D = character.  * = backspace.  # = confirm.
+    """
+    buf = ""
+    lcd_show(prompt, buf + "_")
+    while True:
+        key = keypad_wait()
+        if key is None:
+            continue
+        if key == '#':
+            if buf:
+                return buf
+        elif key == '*':
+            buf = buf[:-1]
+        else:
+            if len(buf) < max_len:
+                buf += key
+        lcd_show(prompt, buf + ("_" if len(buf) < max_len else ""))
+
+
+def keypad_choice(line1: str, options: list[str]) -> int:
+    """
+    LCD menu — A=up, B/D=down, #=confirm.
+    Returns index of selected option.
+    """
+    idx = 0
+    lcd_show(line1, f"> {options[idx]}")
+    while True:
+        key = keypad_wait()
+        if key is None:
+            continue
+        if key == 'A' and idx > 0:
+            idx -= 1
+        elif key in ('B', 'D') and idx < len(options) - 1:
+            idx += 1
+        elif key == '#':
+            return idx
+        lcd_show(line1, f"> {options[idx]}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Module 5 — Audio engine
+# ══════════════════════════════════════════════════════════════════════════════
+
+def audio_init():
+    """Find HiFiBerry DAC and configure sounddevice."""
     sd.default.samplerate = SR
     sd.default.channels   = 1
     sd.default.dtype      = 'float32'
-    idx = _find_hifiberry()
-    if idx is not None:
-        sd.default.device = idx
-        print(f"Audio: [{idx}] {sd.query_devices(idx)['name']}")
-    else:
-        print("WARNING: HiFiBerry DAC not found — using system default audio")
+    for i, dev in enumerate(sd.query_devices()):
+        if 'hifiberry' in dev['name'].lower():
+            sd.default.device = i
+            print(f"Audio: [{i}] {dev['name']}")
+            return
+    print("WARNING: HiFiBerry not found — using system default")
 
 
 def load_wav(path: str) -> np.ndarray:
-    """Load a WAV file, convert to float32 mono at SR."""
-    sr, data = wav.read(path)
+    """Load WAV → float32 mono at SR."""
+    sr_in, data = wav.read(path)
     if data.dtype == np.int16:
         data = data.astype(np.float32) / 32768.0
     elif data.dtype == np.int32:
         data = data.astype(np.float32) / 2147483648.0
     if data.ndim > 1:
         data = data.mean(axis=1)
-    if sr != SR:
-        n_out = int(len(data) * SR / sr)
+    if sr_in != SR:
+        n_out   = int(len(data) * SR / sr_in)
         indices = np.round(np.linspace(0, len(data) - 1, n_out)).astype(int)
-        data = data[indices]
+        data    = data[indices]
     return data.astype(np.float32)
 
 
-def _silence(duration_s: float) -> np.ndarray:
-    return np.zeros(max(1, int(round(duration_s * SR))), dtype=np.float32)
+def _silence(dur_s: float) -> np.ndarray:
+    return np.zeros(max(1, int(round(dur_s * SR))), dtype=np.float32)
 
 
-def _pad_startup(audio: np.ndarray, ms: float = 50) -> np.ndarray:
-    """Prepend brief silence to avoid I2S startup click."""
-    return np.concatenate([_silence(ms / 1000), audio])
-
-
-def _synth_tone(freq: float, duration_s: float) -> np.ndarray:
-    """Synthesize a single tone with harmonics, attack, and release."""
-    n = max(1, int(round(duration_s * SR)))
+def _synth_tone(freq: float, dur_s: float) -> np.ndarray:
+    n = max(1, int(round(dur_s * SR)))
     t = np.arange(n, dtype=np.float64) / SR
-    y = sum(amp * np.sin(2.0 * np.pi * k * freq * t) for k, amp in HARMONICS)
-
+    y = sum(amp * np.sin(2 * np.pi * k * freq * t) for k, amp in HARMONICS)
     atk = max(1, int(ATTACK_MS  * 1e-3 * SR))
     rel = max(1, int(RELEASE_MS * 1e-3 * SR))
     env = np.ones(n, dtype=np.float64)
-    env[:atk]  = np.linspace(0.0, 1.0, atk)
+    env[:atk]  = np.linspace(0, 1, atk)
     if rel < n:
-        env[-rel:] = np.linspace(1.0, 0.0, rel)
+        env[-rel:] = np.linspace(1, 0, rel)
     y *= env
-
     peak = np.max(np.abs(y))
     if peak > 0:
         y = AMPLITUDE * y / peak
     return y.astype(np.float32)
 
 
-def _play_audio(waveform: np.ndarray, blocking: bool = True):
-    """Fire a precomputed waveform through sounddevice."""
+def _pad_startup(audio: np.ndarray, ms: float = 50) -> np.ndarray:
+    return np.concatenate([_silence(ms / 1000), audio])
+
+
+def play_audio(waveform: np.ndarray, blocking: bool = True):
+    """Play a precomputed waveform."""
     sd.play(_pad_startup(waveform), samplerate=SR, blocksize=128)
     if blocking:
         sd.wait()
 
 
+def play_word(words: dict, name: str):
+    """Play a named WAV from the preloaded dict."""
+    if name in words:
+        play_audio(words[name])
+    else:
+        print(f"  [WARN] '{name}.wav' not loaded — skipping")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 2 — Sound waveform builders  (all fully precomputed)
+# Module 6 — Sound waveform builders
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_regular_sound(blocktime_s: float, freq_hz: float) -> np.ndarray:
-    """
-    Regular alternating A4 / E5 train at freq_hz Hz for blocktime_s seconds.
-    Each half-period: tone (TONE_DUTY) + silence (1 - TONE_DUTY).
-    Structure mirrors twotone_precomputed.py.
-    """
-    half_period_s = 0.5 / freq_hz
-    tone_dur_s    = half_period_s * TONE_DUTY
-    gap_dur_s     = half_period_s - tone_dur_s
-
-    tone_lo = _synth_tone(F_LOW,  tone_dur_s)
-    tone_hi = _synth_tone(F_HIGH, tone_dur_s)
-    gap     = _silence(gap_dur_s)
-
-    cycle = np.concatenate([tone_lo, gap, tone_hi, gap])
+    """Regular alternating A4/E5 at freq_hz for blocktime_s."""
+    half   = 0.5 / freq_hz
+    tone_d = half * TONE_DUTY
+    gap_d  = half - tone_d
+    cycle  = np.concatenate([
+        _synth_tone(F_LOW, tone_d), _silence(gap_d),
+        _synth_tone(F_HIGH, tone_d), _silence(gap_d),
+    ])
     n_cyc = max(1, int(np.ceil(blocktime_s / (len(cycle) / SR))))
     train = np.tile(cycle, n_cyc)
     return train[:int(round(blocktime_s * SR))]
 
 
-def build_arrhythmic_sound(blocktime_s: float, freq_hz: float,
-                            arhythmtime_s: float) -> np.ndarray:
+def build_arrhythmic_sound_from_template(template: list,
+                                          blocktime_s: float) -> np.ndarray:
     """
-    Arrhythmic A4/E5 pairs for the first `arhythmtime_s` seconds of the
-    block; silence for the remaining (blocktime_s - arhythmtime_s) seconds.
-
-    Pair structure: A4 tone → intra-pair gap → E5 tone  (same durations as
-    regular train), placed at random inter-onset intervals drawn from
-    U[ARHYTHM_ISI_MIN, ARHYTHM_ISI_MAX].
+    Build arrhythmic waveform from a template.
+    Template: list of (onset_s, intra_gap_s) tuples.
     """
-    arhythmtime_s = min(arhythmtime_s, blocktime_s)
+    total_n       = int(round(blocktime_s * SR))
+    buf           = np.zeros(total_n, dtype=np.float32)
+    base_tone_dur = 0.05
 
-    half_period_s = 0.5 / freq_hz
-    tone_dur_s    = half_period_s * TONE_DUTY
-    gap_dur_s     = half_period_s - tone_dur_s
+    for onset, intra_gap in template:
+        tone_lo  = _synth_tone(F_LOW, base_tone_dur)
+        lo_start = int(round(onset * SR))
+        lo_end   = lo_start + len(tone_lo)
+        if lo_end <= total_n:
+            buf[lo_start:lo_end] += tone_lo
 
-    tone_lo = _synth_tone(F_LOW,  tone_dur_s)
-    tone_hi = _synth_tone(F_HIGH, tone_dur_s)
-    intra   = _silence(gap_dur_s)
-    pair    = np.concatenate([tone_lo, intra, tone_hi])   # one low+high burst
-    pair_n  = len(pair)
-
-    total_n    = int(round(blocktime_s    * SR))
-    arrhythm_n = int(round(arhythmtime_s * SR))
-    buf = np.zeros(total_n, dtype=np.float32)
-
-    t = 0.0
-    while True:
-        isi   = random.uniform(ARHYTHM_ISI_MIN, ARHYTHM_ISI_MAX)
-        onset = t + isi
-        end_s = onset + pair_n / SR
-        if end_s > arhythmtime_s:
-            break
-        start = int(round(onset * SR))
-        buf[start : start + pair_n] += pair
-        t = onset + pair_n / SR
+        hi_onset = onset + base_tone_dur + intra_gap
+        tone_hi  = _synth_tone(F_HIGH, base_tone_dur)
+        hi_start = int(round(hi_onset * SR))
+        hi_end   = hi_start + len(tone_hi)
+        if hi_end <= total_n:
+            buf[hi_start:hi_end] += tone_hi
 
     np.clip(buf, -1.0, 1.0, out=buf)
     return buf
 
 
-def build_silent_sound(blocktime_s: float) -> np.ndarray:
-    return _silence(blocktime_s)
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 3 — Haptic schedule builders  (precomputed event lists)
+# Module 7 — Arrhythmic template generator
 # ══════════════════════════════════════════════════════════════════════════════
-# A haptic schedule is a list of (rel_time_s, effect_id) tuples.
-# play_haptic() fires them at the correct absolute time using perf_counter.
 
-def build_regular_haptic(blocktime_s: float, freq_hz: float,
-                          effect1: int = DEFAULT_EFFECT1,
-                          effect2: int = DEFAULT_EFFECT2) -> list:
+def generate_arrhythmic_templates(n: int, blocktime_s: float) -> list[list]:
     """
-    Alternating effect1 / effect2 at freq_hz Hz for blocktime_s seconds.
-    effect1 fires on the "low" beat, effect2 on the "high" beat,
-    matching the A4/E5 alternation in build_regular_sound().
+    Pre-generate n unique arrhythmic timing templates.
+    Each template = list of (onset_s, intra_gap_s).
+    Both inter-pair ISI and intra-pair gap are randomised.
     """
-    half_period = 0.5 / freq_hz
+    templates     = []
+    base_tone_dur = 0.05
+
+    for _ in range(n):
+        events = []
+        t = random.uniform(0.05, 0.3)
+        while True:
+            intra_gap = random.uniform(ARHYTHM_INTRA_MIN, ARHYTHM_INTRA_MAX)
+            pair_dur  = base_tone_dur + intra_gap + base_tone_dur
+            if t + pair_dur > blocktime_s:
+                break
+            events.append((round(t, 4), round(intra_gap, 4)))
+            isi = random.uniform(ARHYTHM_ISI_MIN, ARHYTHM_ISI_MAX)
+            t  += isi
+        templates.append(events)
+
+    return templates
+
+
+def template_to_haptic_events(template: list,
+                               effect1: int = DEFAULT_EFFECT1,
+                               effect2: int = DEFAULT_EFFECT2) -> list:
+    """Convert arrhythmic template → haptic event list [(time, effect_id)]."""
+    base_tone_dur = 0.05
     events = []
-    t = 0.0
-    while t < blocktime_s - 1e-9:
-        events.append((t, effect1))
-        t += half_period
-        if t < blocktime_s - 1e-9:
-            events.append((t, effect2))
-            t += half_period
-    return events
-
-
-def build_arrhythmic_haptic(blocktime_s: float, freq_hz: float,
-                              arhythmtime_s: float,
-                              effect1: int = DEFAULT_EFFECT1,
-                              effect2: int = DEFAULT_EFFECT2) -> list:
-    """
-    Arrhythmic effect1/effect2 pairs for the first `arhythmtime_s` seconds.
-    Pair structure: effect1 then effect2 spaced by half_period — mirrors
-    build_arrhythmic_sound() so sound and haptic have the same temporal skeleton.
-    """
-    arhythmtime_s = min(arhythmtime_s, blocktime_s)
-    half_period   = 0.5 / freq_hz
-    events        = []
-
-    t = 0.0
-    while True:
-        isi   = random.uniform(ARHYTHM_ISI_MIN, ARHYTHM_ISI_MAX)
-        onset = t + isi
-        if onset >= arhythmtime_s:
-            break
+    for onset, intra_gap in template:
         events.append((onset, effect1))
-        t2 = onset + half_period
-        if t2 < arhythmtime_s:
-            events.append((t2, effect2))
-        t = onset + half_period
+        events.append((onset + base_tone_dur + intra_gap, effect2))
     return events
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 4 — Haptic playback engine
+# Module 8 — Haptic engine
 # ══════════════════════════════════════════════════════════════════════════════
+
+_drv = None
+
+
+def haptic_init():
+    """Initialise DRV2605L."""
+    global _drv
+    if not HAPTIC_AVAILABLE:
+        return
+    try:
+        i2c  = busio.I2C(board.SCL, board.SDA)
+        _drv = adafruit_drv2605.DRV2605(i2c)
+        _drv.use_LRM()
+        _drv.library = 6
+        print("Haptic: DRV2605L initialised (LRA, library 6)")
+    except Exception as e:
+        print(f"WARNING: DRV2605 init failed — {e}")
+        _drv = None
+
 
 def play_haptic(drv, events: list):
-    """
-    Execute a precomputed haptic schedule with sub-millisecond accuracy.
-    Uses sleep + spin-wait: sleep until ~1 ms before the target, then busy-
-    wait for the last slice so the OS scheduler doesn't cause late firing.
-    """
-    if not events:
+    """Fire haptic schedule with spin-wait precision."""
+    if not events or drv is None:
         return
     t0 = time.perf_counter()
     for rel_t, effect_id in events:
         now  = time.perf_counter() - t0
         wait = rel_t - now
         if wait > 0.002:
-            time.sleep(wait - 0.001)               # sleep most of the gap
-        while time.perf_counter() - t0 < rel_t:   # spin the last ~1 ms
+            time.sleep(wait - 0.001)
+        while time.perf_counter() - t0 < rel_t:
             pass
         drv.sequence[0] = adafruit_drv2605.Effect(effect_id)
         drv.play()
@@ -303,7 +459,7 @@ def play_haptic(drv, events: list):
 
 
 def play_haptic_block(drv, events: list, total_s: float):
-    """Play haptic schedule then wait until total_s has elapsed from start."""
+    """Play haptic schedule then wait until total_s elapsed."""
     t0 = time.perf_counter()
     play_haptic(drv, events)
     remaining = total_s - (time.perf_counter() - t0)
@@ -311,357 +467,434 @@ def play_haptic_block(drv, events: list, total_s: float):
         time.sleep(remaining)
 
 
+def build_regular_haptic(blocktime_s: float, freq_hz: float,
+                          effect1: int = DEFAULT_EFFECT1,
+                          effect2: int = DEFAULT_EFFECT2) -> list:
+    """Alternating effect1/effect2 at freq_hz for blocktime_s."""
+    half   = 0.5 / freq_hz
+    events = []
+    t      = 0.0
+    while t < blocktime_s - 1e-9:
+        events.append((t, effect1))
+        t += half
+        if t < blocktime_s - 1e-9:
+            events.append((t, effect2))
+            t += half
+    return events
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 5 — Simultaneous sound + haptic
+# Module 9 — Simultaneous playback (audio + haptic)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def play_simultaneous(drv, waveform: np.ndarray,
                        haptic_events: list, total_s: float):
-    """
-    Play audio waveform and haptic schedule at the same time using two threads.
-    Both threads are started as close together as possible; the function
-    returns only after both have finished (or total_s has elapsed).
-    """
+    """Play audio and haptic in parallel via barrier-synced threads."""
     barrier = threading.Barrier(2)
 
-    def _audio_thread():
+    def _audio():
         barrier.wait()
-        _play_audio(waveform, blocking=True)
+        play_audio(waveform, blocking=True)
 
-    def _haptic_thread():
+    def _haptic():
         barrier.wait()
         play_haptic_block(drv, haptic_events, total_s)
 
-    t_audio  = threading.Thread(target=_audio_thread,  daemon=True)
-    t_haptic = threading.Thread(target=_haptic_thread, daemon=True)
-    t_audio.start()
-    t_haptic.start()
-    t_audio.join()
-    t_haptic.join()
+    ta = threading.Thread(target=_audio,  daemon=True)
+    th = threading.Thread(target=_haptic, daemon=True)
+    ta.start(); th.start()
+    ta.join();  th.join()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 6 — DRV2605 singleton
+# Module 10 — CSV logger
 # ══════════════════════════════════════════════════════════════════════════════
 
-_drv_instance = None
+class ExperimentLogger:
+    """Writes trial-level data to a timestamped CSV."""
 
-def _get_drv():
-    global _drv_instance
-    if _drv_instance is None:
-        if not HAPTIC_AVAILABLE:
-            raise RuntimeError("adafruit_drv2605 not installed")
-        i2c = busio.I2C(board.SCL, board.SDA)
-        _drv_instance = adafruit_drv2605.DRV2605(i2c)
-        _drv_instance.use_LRM()   # LRA (Linear Resonance Motor) mode
-        _drv_instance.library = 6 # Library 6: LRA effects
-        print("Haptic: DRV2605L initialised (LRA mode, library 6)")
-    return _drv_instance
+    HEADER = [
+        'participant_id', 'trial_num', 'modality',
+        'template_index', 'template_onsets',
+        'block1_type', 'block2_type', 'block3_type', 'block4_type',
+        'trial_start_time', 'trial_end_time',
+    ]
+
+    def __init__(self, participant_id: str, output_dir: str = '.'):
+        self.pid = participant_id
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.filename = os.path.join(
+            output_dir, f"cue_log_{participant_id}_{ts}.csv"
+        )
+        with open(self.filename, 'w', newline='') as f:
+            csv.writer(f).writerow(self.HEADER)
+        print(f"Logger: {self.filename}")
+
+    def log_trial(self, trial_num: int, modality: str,
+                  template_index: int, template_onsets: list,
+                  trial_start: str, trial_end: str):
+        onsets_str = ";".join(
+            f"{o:.4f}:{g:.4f}" for o, g in template_onsets
+        )
+        row = [
+            self.pid, trial_num, modality,
+            template_index, onsets_str,
+            'arrhythmic', 'silent', 'regular', 'silent',
+            trial_start, trial_end,
+        ]
+        with open(self.filename, 'a', newline='') as f:
+            csv.writer(f).writerow(row)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 7 — Trial block generators (public API)
+# Module 11 — Trial runners
 # ══════════════════════════════════════════════════════════════════════════════
 
-def generate_cue_sound(blocktime: float = 15, freq: float = 1,
-                        arhythmtime: float = 5):
+def run_trial_sound(blocktime: float, freq: float, template: list,
+                     words: dict):
     """
-    One sound trial — three sequential sub-blocks:
-
-      1. Arrhythmic A4/E5 pairs for the first `arhythmtime` s,
-         silence for the remainder  (total = blocktime s)
-      2. Regular alternating A4/E5 at `freq` Hz  (blocktime s)
-      3. Silence                                  (blocktime s)
-
-    All three waveforms are precomputed before playback begins to minimise
-    Python-level jitter during delivery.
+    SOUND trial — 4 blocks:
+      'ready' → pause → 'walk' →
+      Block 1: arrhythmic → Block 2: silent →
+      Block 3: regular    → Block 4: silent →
+      'rest'
     """
-    print("  [SOUND] Precomputing waveforms...", end=' ', flush=True)
-    w_arrhythm = build_arrhythmic_sound(blocktime, freq, arhythmtime)
+    print("    Precomputing waveforms...", flush=True)
+    w_arrhythm = build_arrhythmic_sound_from_template(template, blocktime)
     w_regular  = build_regular_sound(blocktime, freq)
-    w_silent   = build_silent_sound(blocktime)
-    print("done")
+    w_silent   = _silence(blocktime)
 
-    print(f"  [SOUND] Sub-block 1: arrhythmic ({arhythmtime:.0f}s active / {blocktime:.0f}s total)")
-    _play_audio(w_arrhythm)
+    lcd_show("SOUND", "Get ready...")
+    play_word(words, 'ready')
+    jitter = random.uniform(-0.5, 0.5)
+    time.sleep(max(0.5, 2.0 + jitter))
+    play_word(words, 'walk')
 
-    print(f"  [SOUND] Sub-block 2: regular {freq}Hz for {blocktime:.0f}s")
-    _play_audio(w_regular)
+    lcd_show("SOUND 1/4", "Arrhythmic")
+    print(f"    Block 1: arrhythmic ({len(template)} pairs)")
+    play_audio(w_arrhythm)
 
-    print(f"  [SOUND] Sub-block 3: silence {blocktime:.0f}s")
-    _play_audio(w_silent)
+    lcd_show("SOUND 2/4", "Silent")
+    print(f"    Block 2: silent")
+    play_audio(w_silent)
+
+    lcd_show("SOUND 3/4", "Regular")
+    print(f"    Block 3: regular {freq}Hz")
+    play_audio(w_regular)
+
+    lcd_show("SOUND 4/4", "Silent")
+    print(f"    Block 4: silent")
+    play_audio(w_silent)
+
+    play_word(words, 'rest')
 
 
-def generate_cue_vibration(blocktime: float = 15, freq: float = 1,
-                            effect1: int = DEFAULT_EFFECT1,
-                            effect2: int = DEFAULT_EFFECT2,
-                            arhythmtime: float = 5):
+def run_trial_vibration(blocktime: float, freq: float, template: list,
+                         words: dict,
+                         effect1: int = DEFAULT_EFFECT1,
+                         effect2: int = DEFAULT_EFFECT2):
     """
-    One haptic trial — three sequential sub-blocks mirroring generate_cue_sound():
-
-      1. Arrhythmic effect1/effect2 pairs for the first `arhythmtime` s  (blocktime s total)
-      2. Regular alternating effect1/effect2 at `freq` Hz                 (blocktime s)
-      3. No vibration                                                      (blocktime s)
-
-    Haptic schedules are precomputed as (time, effect_id) lists, then fired
-    via a spin-wait loop for precise timing — analogous to precomputing the
-    audio waveform.
+    VIBRATION trial — 4 blocks:
+      'ready' → pause → 'walk' →
+      Block 1: arrhythmic haptic → Block 2: silent →
+      Block 3: regular haptic    → Block 4: silent →
+      'rest'
     """
-    if not HAPTIC_AVAILABLE:
-        print("  [HAPTIC] Driver not available — waiting silently")
-        time.sleep(blocktime * 3)
+    drv = _drv
+    if drv is None:
+        print("    [HAPTIC] No driver — waiting silently")
+        time.sleep(blocktime * 4)
         return
 
-    drv = _get_drv()
+    print("    Precomputing haptic schedules...", flush=True)
+    h_arrhythm = template_to_haptic_events(template, effect1, effect2)
+    h_regular  = build_regular_haptic(blocktime, freq, effect1, effect2)
 
-    print("  [HAPTIC] Precomputing schedules...", end=' ', flush=True)
-    sched_arrhythm = build_arrhythmic_haptic(blocktime, freq, arhythmtime,
-                                              effect1, effect2)
-    sched_regular  = build_regular_haptic(blocktime, freq, effect1, effect2)
-    print(f"done ({len(sched_arrhythm)} arrhythmic events, "
-          f"{len(sched_regular)} regular events)")
+    lcd_show("VIBRATION", "Get ready...")
+    play_word(words, 'ready')
+    jitter = random.uniform(-0.5, 0.5)
+    time.sleep(max(0.5, 2.0 + jitter))
+    play_word(words, 'walk')
 
-    print(f"  [HAPTIC] Sub-block 1: arrhythmic ({arhythmtime:.0f}s active / {blocktime:.0f}s total)")
-    play_haptic_block(drv, sched_arrhythm, blocktime)
+    lcd_show("VIBR 1/4", "Arrhythmic")
+    print(f"    Block 1: arrhythmic ({len(h_arrhythm)} events)")
+    play_haptic_block(drv, h_arrhythm, blocktime)
 
-    print(f"  [HAPTIC] Sub-block 2: regular {freq}Hz, "
-          f"effect{effect1}/{effect2} for {blocktime:.0f}s")
-    play_haptic_block(drv, sched_regular, blocktime)
-
-    print(f"  [HAPTIC] Sub-block 3: no vibration {blocktime:.0f}s")
+    lcd_show("VIBR 2/4", "Silent")
+    print(f"    Block 2: no vibration")
     time.sleep(blocktime)
 
+    lcd_show("VIBR 3/4", "Regular")
+    print(f"    Block 3: regular {freq}Hz")
+    play_haptic_block(drv, h_regular, blocktime)
 
-def test_simultaneous(blocktime: float = 15, freq: float = 1,
-                       effect1: int = DEFAULT_EFFECT1,
-                       effect2: int = DEFAULT_EFFECT2):
-    """
-    Simultaneous delivery test: regular sound + regular haptic at the same
-    time for one blocktime. Used to verify hardware synchrony.
-    """
-    print("\n=== Simultaneous delivery test ===")
-    print("  Precomputing...", end=' ', flush=True)
-    waveform = build_regular_sound(blocktime, freq)
-    if HAPTIC_AVAILABLE:
-        drv    = _get_drv()
-        events = build_regular_haptic(blocktime, freq, effect1, effect2)
-        print("done")
-        print(f"  Playing sound + haptic simultaneously for {blocktime:.0f}s")
-        play_simultaneous(drv, waveform, events, blocktime)
+    lcd_show("VIBR 4/4", "Silent")
+    print(f"    Block 4: no vibration")
+    time.sleep(blocktime)
+
+    play_word(words, 'rest')
+
+
+def run_trial_simultaneous(blocktime: float, freq: float, template: list,
+                            words: dict,
+                            effect1: int = DEFAULT_EFFECT1,
+                            effect2: int = DEFAULT_EFFECT2):
+    """SIMULTANEOUS trial — sound + haptic together per block."""
+    drv = _drv
+
+    print("    Precomputing sound+haptic...", flush=True)
+    w_arrhythm = build_arrhythmic_sound_from_template(template, blocktime)
+    w_regular  = build_regular_sound(blocktime, freq)
+    w_silent   = _silence(blocktime)
+    h_arrhythm = template_to_haptic_events(template, effect1, effect2) if drv else []
+    h_regular  = build_regular_haptic(blocktime, freq, effect1, effect2) if drv else []
+
+    lcd_show("SIMUL", "Get ready...")
+    play_word(words, 'ready')
+    jitter = random.uniform(-0.5, 0.5)
+    time.sleep(max(0.5, 2.0 + jitter))
+    play_word(words, 'walk')
+
+    lcd_show("SIMUL 1/4", "Arrhythmic")
+    print(f"    Block 1: arrhythmic simultaneous")
+    if drv:
+        play_simultaneous(drv, w_arrhythm, h_arrhythm, blocktime)
     else:
-        print("done (haptic unavailable — sound only)")
-        _play_audio(waveform)
-    print("  Simultaneous test complete.")
+        play_audio(w_arrhythm)
+
+    lcd_show("SIMUL 2/4", "Silent")
+    print(f"    Block 2: silent")
+    play_audio(w_silent)
+
+    lcd_show("SIMUL 3/4", "Regular")
+    print(f"    Block 3: regular simultaneous")
+    if drv:
+        play_simultaneous(drv, w_regular, h_regular, blocktime)
+    else:
+        play_audio(w_regular)
+
+    lcd_show("SIMUL 4/4", "Silent")
+    print(f"    Block 4: silent")
+    play_audio(w_silent)
+
+    play_word(words, 'rest')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 8 — Main experiment API
+# Module 12 — User input helpers (keypad or terminal fallback)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _play_word(words: dict, name: str):
-    if name in words:
-        _play_audio(words[name])
+def get_participant_id() -> str:
+    if KEYPAD_AVAILABLE and _kp_rows is not None:
+        lcd_show("Participant ID:", "Key in + # OK")
+        return keypad_input_string("Participant ID:")
     else:
-        print(f"  [WARN] '{name}.wav' not loaded — skipping")
+        return input("Enter participant ID: ").strip()
 
 
-def _wait_for_y() -> bool:
-    """Block until user presses 'y' (continue) or 'q' (quit)."""
-    while True:
-        try:
-            key = input("  >> Press y + ENTER to continue, q to quit: ").strip().lower()
-        except EOFError:
-            return False
-        if key == 'y':
-            return True
-        if key == 'q':
-            print("  Experiment stopped by user.")
-            return False
-        print("  (enter 'y' or 'q')")
+def wait_for_continue() -> bool:
+    """# = continue, * = quit."""
+    lcd_show("Press # to", "continue  *=quit")
+    if KEYPAD_AVAILABLE and _kp_rows is not None:
+        while True:
+            key = keypad_wait(timeout=300)
+            if key == '#':
+                return True
+            if key == '*':
+                return False
+    else:
+        while True:
+            try:
+                k = input("  >> y=continue, q=quit: ").strip().lower()
+            except EOFError:
+                return False
+            if k == 'y':
+                return True
+            if k == 'q':
+                return False
 
 
-def generate_cue(
-    blocknum:    int   = 20,
-    blocktime:   float = 15,
-    preptime:    float = 2,
-    freq:        float = 1,
-    randomize:   bool  = False,
-    firstblock:  str   = 'sound',
-    effect1:     int   = DEFAULT_EFFECT1,
-    effect2:     int   = DEFAULT_EFFECT2,
-    arhythmtime: float = 5,
-    run_simtest: bool  = False,
-):
-    """
-    Main experiment entry point.
+# ══════════════════════════════════════════════════════════════════════════════
+# Module 13 — Main experiment
+# ══════════════════════════════════════════════════════════════════════════════
 
-    Parameters
-    ----------
-    blocknum     : number of trials per modality (or total trials if randomize=True)
-    blocktime    : duration of each sub-block in seconds (3 sub-blocks per trial)
-    preptime     : pause between 'ready.wav' and 'walk.wav', ± 0.5 s jitter
-    freq         : cue frequency in Hz (beats per second within each sub-block)
-    randomize    : if True,  assign modality randomly for each of blocknum trials;
-                   if False, run firstblock × blocknum then other modality × blocknum
-    firstblock   : 'sound' or 'vibration' (used when randomize=False)
-    effect1      : DRV2605 built-in effect number for the "low" beat
-    effect2      : DRV2605 built-in effect number for the "high" beat
-    arhythmtime  : arrhythmic window at the start of sub-block 1 (seconds)
-    run_simtest  : if True, run a simultaneous delivery test before the experiment
+def main():
+    args = parse_args()
 
-    Trial structure (per trial)
-    ---------------------------
-      Sub-block 1 — blocktime s: arrhythmic pairs, active for first arhythmtime s
-      Sub-block 2 — blocktime s: regular rhythmic at freq Hz
-      Sub-block 3 — blocktime s: silence / no vibration
-      → play 'rest.wav', wait for 'y' before next trial
-    """
-    if firstblock not in ('sound', 'vibration'):
-        raise ValueError(f"firstblock must be 'sound' or 'vibration', got {firstblock!r}")
+    # ── Init hardware ────────────────────────────────────────────────────
+    audio_init()
+    lcd_init()
+    keypad_init()
+    haptic_init()
 
-    _setup_audio()
+    if args.list_devices:
+        print(sd.query_devices())
+        keypad_close()
+        return
 
-    # Pre-load instruction WAV files
-    WAV_FILES = ['ready', 'walk', 'rest']
-    words = {}
-    for name in WAV_FILES:
-        try:
-            words[name] = load_wav(f'{name}.wav')
-            print(f"Loaded {name}.wav  ({len(words[name])/SR:.2f}s)")
-        except FileNotFoundError:
-            print(f"WARNING: {name}.wav not found — will skip")
-        except Exception as exc:
-            print(f"WARNING: could not load {name}.wav — {exc}")
+    # ── Participant ID ───────────────────────────────────────────────────
+    lcd_show("== CUE EXPT ==", "Starting...")
+    time.sleep(1)
 
-    # Optional simultaneous test
-    if run_simtest:
-        test_simultaneous(blocktime, freq, effect1, effect2)
-        if not _wait_for_y():
-            return
+    participant_id = get_participant_id()
+    lcd_show(f"ID: {participant_id}", "Confirmed")
+    print(f"\nParticipant: {participant_id}")
+    time.sleep(1)
 
-    # Build trial modality sequence
-    if randomize:
-        modalities = [random.choice(['sound', 'vibration']) for _ in range(blocknum)]
+    # ── Parameters ───────────────────────────────────────────────────────
+    blocknum  = args.blocknum
+    blocktime = args.blocktime
+    freq      = args.freq
+    effect1   = args.effect1
+    effect2   = args.effect2
+
+    # ── Generate 20 arrhythmic templates ─────────────────────────────────
+    print(f"\nGenerating {NUM_TEMPLATES} arrhythmic templates "
+          f"({blocktime}s each)...")
+    templates = generate_arrhythmic_templates(NUM_TEMPLATES, blocktime)
+    for i, tpl in enumerate(templates):
+        if tpl:
+            print(f"  Template {i:2d}: {len(tpl)} pairs, "
+                  f"span {tpl[-1][0]:.2f}s")
+        else:
+            print(f"  Template {i:2d}: empty")
+
+    # Shuffle order — no repetition within first 20 trials
+    template_order = list(range(NUM_TEMPLATES))
+    random.shuffle(template_order)
+
+    # ── Build modality sequence ──────────────────────────────────────────
+    if args.randomize:
+        modalities = [random.choice(['sound', 'vibration'])
+                      for _ in range(blocknum)]
         mode_desc  = f"randomized ({blocknum} trials)"
     else:
-        other      = 'vibration' if firstblock == 'sound' else 'sound'
-        modalities = [firstblock] * blocknum + [other] * blocknum
-        mode_desc  = f"{firstblock} × {blocknum}, then {other} × {blocknum}"
+        first = args.firstblock
+        other = 'vibration' if first == 'sound' else 'sound'
+        modalities = [first] * blocknum + [other] * blocknum
+        mode_desc  = f"{first} x{blocknum} then {other} x{blocknum}"
 
-    total_trials   = len(modalities)
-    trial_dur_s    = blocktime * 3
-    experiment_min = total_trials * trial_dur_s / 60
+    total_trials = len(modalities)
+
+    # ── Logger ───────────────────────────────────────────────────────────
+    logger = ExperimentLogger(participant_id)
+
+    # ── Pre-load WAV cues ────────────────────────────────────────────────
+    words = {}
+    for name in ['ready', 'walk', 'rest']:
+        try:
+            words[name] = load_wav(f'{name}.wav')
+            print(f"Loaded {name}.wav ({len(words[name])/SR:.2f}s)")
+        except FileNotFoundError:
+            print(f"WARNING: {name}.wav not found")
+        except Exception as e:
+            print(f"WARNING: {name}.wav — {e}")
+
+    # ── Summary ──────────────────────────────────────────────────────────
+    trial_dur   = blocktime * 4
+    est_minutes = total_trials * trial_dur / 60
 
     print(f"\n{'='*60}")
-    print(f"Experiment start")
-    print(f"  Modality order : {mode_desc}")
-    print(f"  Trials         : {total_trials}")
-    print(f"  Sub-block time : {blocktime}s  ×3 = {trial_dur_s}s per trial")
-    print(f"  Cue frequency  : {freq} Hz")
-    print(f"  Arrhythm window: {arhythmtime}s")
-    print(f"  Effects        : #{effect1} (low) / #{effect2} (high)")
-    print(f"  Est. duration  : ~{experiment_min:.1f} min (excl. rest periods)")
+    print(f"  Participant   : {participant_id}")
+    print(f"  Modalities    : {mode_desc}")
+    print(f"  Trials        : {total_trials}")
+    print(f"  Block time    : {blocktime}s x 4 = {trial_dur}s / trial")
+    print(f"  Block order   : arrhythmic > silent > regular > silent")
+    print(f"  Frequency     : {freq} Hz")
+    print(f"  Templates     : {NUM_TEMPLATES} (shuffled, no repeat)")
+    print(f"  Est. duration : ~{est_minutes:.1f} min (excl. rests)")
+    print(f"  Log file      : {logger.filename}")
     print(f"{'='*60}")
 
-    # ── Preparation phase ────────────────────────────────────────────────────
-    print("\n[PREP] Playing 'ready'...")
-    _play_word(words, 'ready')
+    lcd_show(f"{total_trials} trials", f"~{est_minutes:.0f} min total")
+    time.sleep(2)
 
-    jitter   = random.uniform(-0.5, 0.5)
-    pause    = max(0.5, preptime + jitter)
-    print(f"[PREP] Waiting {pause:.2f}s (preptime={preptime}s, jitter={jitter:+.2f}s)")
-    time.sleep(pause)
+    # ── Optional simultaneous test ───────────────────────────────────────
+    if args.simtest:
+        lcd_show("Simul. test", "Sound + Haptic")
+        run_trial_simultaneous(blocktime, freq, templates[0], words,
+                               effect1, effect2)
+        if not wait_for_continue():
+            keypad_close()
+            return
 
-    print("[PREP] Playing 'walk'...")
-    _play_word(words, 'walk')
-
-    # ── Trial loop ───────────────────────────────────────────────────────────
+    # ── Trial loop ───────────────────────────────────────────────────────
     for idx, modality in enumerate(modalities):
+        tpl_idx   = template_order[idx % NUM_TEMPLATES]
+        template  = templates[tpl_idx]
+        trial_num = idx + 1
+
         print(f"\n{'─'*50}")
-        print(f"Trial {idx + 1}/{total_trials}  [{modality.upper()}]")
+        print(f"  Trial {trial_num}/{total_trials}  "
+              f"[{modality.upper()}]  template #{tpl_idx}")
         print(f"{'─'*50}")
-        t_trial = time.perf_counter()
+
+        lcd_show(f"Trial {trial_num}/{total_trials}",
+                 f"{modality} T#{tpl_idx}")
+
+        t_start = datetime.now().isoformat()
+        t0      = time.perf_counter()
 
         if modality == 'sound':
-            generate_cue_sound(blocktime=blocktime, freq=freq,
-                               arhythmtime=arhythmtime)
+            run_trial_sound(blocktime, freq, template, words)
+        elif modality == 'vibration':
+            run_trial_vibration(blocktime, freq, template, words,
+                                effect1, effect2)
         else:
-            generate_cue_vibration(blocktime=blocktime, freq=freq,
-                                   effect1=effect1, effect2=effect2,
-                                   arhythmtime=arhythmtime)
+            run_trial_simultaneous(blocktime, freq, template, words,
+                                   effect1, effect2)
 
-        elapsed = time.perf_counter() - t_trial
-        print(f"  Trial {idx + 1} complete ({elapsed:.1f}s)")
+        t_end   = datetime.now().isoformat()
+        elapsed = time.perf_counter() - t0
 
-        _play_word(words, 'rest')
+        logger.log_trial(
+            trial_num=trial_num,
+            modality=modality,
+            template_index=tpl_idx,
+            template_onsets=template,
+            trial_start=t_start,
+            trial_end=t_end,
+        )
+
+        print(f"  Trial {trial_num} done ({elapsed:.1f}s)")
+        lcd_show("Rest", "# next  * quit")
 
         if idx < total_trials - 1:
-            if not _wait_for_y():
-                return
+            if not wait_for_continue():
+                break
 
+    # ── Done ─────────────────────────────────────────────────────────────
+    lcd_show("Experiment", "Complete!")
     print(f"\n{'='*60}")
-    print("Experiment complete. Well done!")
+    print(f"Experiment complete — {logger.filename}")
     print(f"{'='*60}")
+    time.sleep(3)
+    lcd_show("", "")
+    keypad_close()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 9 — CLI entry point
+# Module 14 — CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _parse_args():
+def parse_args():
     p = argparse.ArgumentParser(
-        description="Rhythmic cueing experiment (sound + haptic)",
+        description="Rhythmic cueing experiment",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument('--blocknum',    type=int,   default=20,
-                   help='Trials per modality (or total if --randomize)')
-    p.add_argument('--blocktime',   type=float, default=15,
-                   help='Duration of each sub-block (s)')
-    p.add_argument('--preptime',    type=float, default=2,
-                   help='Pause between ready/walk cues (s, ±0.5s jitter)')
-    p.add_argument('--freq',        type=float, default=1.0,
-                   help='Cue frequency within each block (Hz)')
-    p.add_argument('--randomize',   action='store_true',
-                   help='Randomise modality assignment across trials')
+    p.add_argument('--blocknum',    type=int,   default=20)
+    p.add_argument('--blocktime',   type=float, default=15)
+    p.add_argument('--freq',        type=float, default=1.0)
+    p.add_argument('--randomize',   action='store_true')
     p.add_argument('--firstblock',  type=str,   default='sound',
-                   choices=['sound', 'vibration'],
-                   help='First modality when not randomising')
-    p.add_argument('--effect1',     type=int,   default=DEFAULT_EFFECT1,
-                   help='DRV2605 effect # for "low" beat')
-    p.add_argument('--effect2',     type=int,   default=DEFAULT_EFFECT2,
-                   help='DRV2605 effect # for "high" beat')
-    p.add_argument('--arhythmtime', type=float, default=5,
-                   help='Arrhythmic active window in sub-block 1 (s)')
+                   choices=['sound', 'vibration'])
+    p.add_argument('--effect1',     type=int,   default=DEFAULT_EFFECT1)
+    p.add_argument('--effect2',     type=int,   default=DEFAULT_EFFECT2)
     p.add_argument('--simtest',     action='store_true',
-                   help='Run simultaneous sound+haptic test before experiment')
-    p.add_argument('--simtest-only', action='store_true',
-                   help='Run simultaneous test only, then exit')
-    p.add_argument('--list-devices', action='store_true',
-                   help='List audio devices and exit')
+                   help='Run simultaneous test before experiment')
+    p.add_argument('--list-devices', action='store_true')
     return p.parse_args()
 
 
 if __name__ == '__main__':
-    args = _parse_args()
-
-    if args.list_devices:
-        print(sd.query_devices())
-        sys.exit(0)
-
-    if args.simtest_only:
-        _setup_audio()
-        test_simultaneous(args.blocktime, args.freq, args.effect1, args.effect2)
-        sys.exit(0)
-
-    generate_cue(
-        blocknum    = args.blocknum,
-        blocktime   = args.blocktime,
-        preptime    = args.preptime,
-        freq        = args.freq,
-        randomize   = args.randomize,
-        firstblock  = args.firstblock,
-        effect1     = args.effect1,
-        effect2     = args.effect2,
-        arhythmtime = args.arhythmtime,
-        run_simtest = args.simtest,
-    )
+    main()
