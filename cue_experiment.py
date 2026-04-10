@@ -31,9 +31,8 @@ import argparse
 import csv
 import os
 import random
-import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 import sounddevice as sd
@@ -78,17 +77,17 @@ except ImportError:
 SR         = 48000
 F_LOW      = 440.0      # A4
 F_HIGH     = 659.3      # E5
-AMPLITUDE  = 0.80
+AMPLITUDE  = 1
 ATTACK_MS  = 5
 RELEASE_MS = 20
 HARMONICS  = [(1, 1.00), (2, 0.30), (3, 0.15), (4, 0.10)]
-TONE_DUTY  = 0.3
+TONE_DURATION = 0.15
 
 # Arrhythmic timing — both inter-pair AND intra-pair randomised
-ARHYTHM_ISI_MIN   = 0.1
-ARHYTHM_ISI_MAX   = 0.9
-ARHYTHM_INTRA_MIN = 0.1
-ARHYTHM_INTRA_MAX = 0.9
+ARHYTHM_INTER_MIN   = 0.2
+ARHYTHM_INTER_MAX   = 0.8
+ARHYTHM_INTRA_MIN = 0.2
+ARHYTHM_INTRA_MAX = 0.8 
 
 # Templates
 NUM_TEMPLATES = 20
@@ -317,7 +316,7 @@ def _pad_startup(audio: np.ndarray, ms: float = 50) -> np.ndarray:
 
 
 def play_audio(waveform: np.ndarray, blocking: bool = True):
-    """Play a precomputed waveform."""
+    """Play a precomputed waveform with padded start for buffering."""
     sd.play(_pad_startup(waveform), samplerate=SR, blocksize=128)
     if blocking:
         sd.wait()
@@ -338,7 +337,7 @@ def play_word(words: dict, name: str):
 def build_regular_sound(blocktime_s: float, freq_hz: float) -> np.ndarray:
     """Regular alternating A4/E5 at freq_hz for blocktime_s."""
     half   = 0.5 / freq_hz
-    tone_d = half * TONE_DUTY
+    tone_d = TONE_DURATION
     gap_d  = half - tone_d
     cycle  = np.concatenate([
         _synth_tone(F_LOW, tone_d), _silence(gap_d),
@@ -357,17 +356,17 @@ def build_arrhythmic_sound_from_template(template: list,
     """
     total_n       = int(round(blocktime_s * SR))
     buf           = np.zeros(total_n, dtype=np.float32)
-    base_tone_dur = 0.05
+    tone_dur = TONE_DURATION
 
     for onset, intra_gap in template:
-        tone_lo  = _synth_tone(F_LOW, base_tone_dur)
+        tone_lo  = _synth_tone(F_LOW, tone_dur)
         lo_start = int(round(onset * SR))
         lo_end   = lo_start + len(tone_lo)
         if lo_end <= total_n:
             buf[lo_start:lo_end] += tone_lo
 
-        hi_onset = onset + base_tone_dur + intra_gap
-        tone_hi  = _synth_tone(F_HIGH, base_tone_dur)
+        hi_onset = onset + tone_dur + intra_gap
+        tone_hi  = _synth_tone(F_HIGH, tone_dur)
         hi_start = int(round(hi_onset * SR))
         hi_end   = hi_start + len(tone_hi)
         if hi_end <= total_n:
@@ -388,18 +387,18 @@ def generate_arrhythmic_templates(n: int, blocktime_s: float) -> list[list]:
     Both inter-pair ISI and intra-pair gap are randomised.
     """
     templates     = []
-    base_tone_dur = 0.05
+    base_tone_dur = TONE_DURATION
 
     for _ in range(n):
         events = []
-        t = random.uniform(0.05, 0.3)
+        t = random.uniform(0.1, 0.6) # add small jitter at the start 
         while True:
             intra_gap = random.uniform(ARHYTHM_INTRA_MIN, ARHYTHM_INTRA_MAX)
             pair_dur  = base_tone_dur + intra_gap + base_tone_dur
-            if t + pair_dur > blocktime_s:
+            if  t + pair_dur > blocktime_s:
                 break
             events.append((round(t, 4), round(intra_gap, 4)))
-            isi = random.uniform(ARHYTHM_ISI_MIN, ARHYTHM_ISI_MAX)
+            isi = random.uniform(ARHYTHM_INTER_MIN, ARHYTHM_INTER_MAX)
             t  += isi
         templates.append(events)
 
@@ -410,11 +409,11 @@ def template_to_haptic_events(template: list,
                                effect1: int = DEFAULT_EFFECT1,
                                effect2: int = DEFAULT_EFFECT2) -> list:
     """Convert arrhythmic template → haptic event list [(time, effect_id)]."""
-    base_tone_dur = 0.05
+    tone_dur = TONE_DURATION
     events = []
     for onset, intra_gap in template:
         events.append((onset, effect1))
-        events.append((onset + base_tone_dur + intra_gap, effect2))
+        events.append((onset + tone_dur + intra_gap, effect2))
     return events
 
 
@@ -484,40 +483,19 @@ def build_regular_haptic(blocktime_s: float, freq_hz: float,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 9 — Simultaneous playback (audio + haptic)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def play_simultaneous(drv, waveform: np.ndarray,
-                       haptic_events: list, total_s: float):
-    """Play audio and haptic in parallel via barrier-synced threads."""
-    barrier = threading.Barrier(2)
-
-    def _audio():
-        barrier.wait()
-        play_audio(waveform, blocking=True)
-
-    def _haptic():
-        barrier.wait()
-        play_haptic_block(drv, haptic_events, total_s)
-
-    ta = threading.Thread(target=_audio,  daemon=True)
-    th = threading.Thread(target=_haptic, daemon=True)
-    ta.start(); th.start()
-    ta.join();  th.join()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Module 10 — CSV logger
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ExperimentLogger:
-    """Writes trial-level data to a timestamped CSV."""
+    """Writes block-level data to a timestamped CSV."""
 
     HEADER = [
-        'participant_id', 'trial_num', 'modality',
-        'template_index', 'template_onsets',
-        'block1_type', 'block2_type', 'block3_type', 'block4_type',
-        'trial_start_time', 'trial_end_time',
+        'participant_id',
+        'trial_num',
+        'block_start_time_utc',
+        'block_type',
+        'template_number',
+        'block_number_in_trial',
     ]
 
     def __init__(self, participant_id: str, output_dir: str = '.'):
@@ -530,17 +508,18 @@ class ExperimentLogger:
             csv.writer(f).writerow(self.HEADER)
         print(f"Logger: {self.filename}")
 
-    def log_trial(self, trial_num: int, modality: str,
-                  template_index: int, template_onsets: list,
-                  trial_start: str, trial_end: str):
-        onsets_str = ";".join(
-            f"{o:.4f}:{g:.4f}" for o, g in template_onsets
+    def log_block(self, trial_num: int, block_type: str,
+                  template_number: int | str, block_number_in_trial: int):
+        block_start_time_utc = datetime.now(timezone.utc).isoformat(
+            timespec='microseconds'
         )
         row = [
-            self.pid, trial_num, modality,
-            template_index, onsets_str,
-            'arrhythmic', 'silent', 'regular', 'silent',
-            trial_start, trial_end,
+            self.pid,
+            trial_num,
+            block_start_time_utc,
+            block_type,
+            template_number,
+            block_number_in_trial,
         ]
         with open(self.filename, 'a', newline='') as f:
             csv.writer(f).writerow(row)
@@ -551,7 +530,8 @@ class ExperimentLogger:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_trial_sound(blocktime: float, freq: float, template: list,
-                     words: dict):
+                     words: dict, logger: ExperimentLogger,
+                     trial_num: int, template_index: int):
     """
     SOUND trial — 4 blocks:
       'ready' → pause → 'walk' →
@@ -570,18 +550,22 @@ def run_trial_sound(blocktime: float, freq: float, template: list,
     time.sleep(max(0.5, 2.0 + jitter))
     play_word(words, 'walk')
 
+    logger.log_block(trial_num, 'sound', template_index, 1)
     lcd_show("SOUND 1/4", "Arrhythmic")
     print(f"    Block 1: arrhythmic ({len(template)} pairs)")
     play_audio(w_arrhythm)
 
+    logger.log_block(trial_num, 'sound', '', 2)
     lcd_show("SOUND 2/4", "Silent")
     print(f"    Block 2: silent")
     play_audio(w_silent)
 
+    logger.log_block(trial_num, 'sound', '', 3)
     lcd_show("SOUND 3/4", "Regular")
     print(f"    Block 3: regular {freq}Hz")
     play_audio(w_regular)
 
+    logger.log_block(trial_num, 'sound', '', 4)
     lcd_show("SOUND 4/4", "Silent")
     print(f"    Block 4: silent")
     play_audio(w_silent)
@@ -590,7 +574,8 @@ def run_trial_sound(blocktime: float, freq: float, template: list,
 
 
 def run_trial_vibration(blocktime: float, freq: float, template: list,
-                         words: dict,
+                         words: dict, logger: ExperimentLogger,
+                         trial_num: int, template_index: int,
                          effect1: int = DEFAULT_EFFECT1,
                          effect2: int = DEFAULT_EFFECT2):
     """
@@ -616,66 +601,25 @@ def run_trial_vibration(blocktime: float, freq: float, template: list,
     time.sleep(max(0.5, 2.0 + jitter))
     play_word(words, 'walk')
 
+    logger.log_block(trial_num, 'vib', template_index, 1)
     lcd_show("VIBR 1/4", "Arrhythmic")
     print(f"    Block 1: arrhythmic ({len(h_arrhythm)} events)")
     play_haptic_block(drv, h_arrhythm, blocktime)
 
+    logger.log_block(trial_num, 'vib', '', 2)
     lcd_show("VIBR 2/4", "Silent")
     print(f"    Block 2: no vibration")
     time.sleep(blocktime)
 
+    logger.log_block(trial_num, 'vib', '', 3)
     lcd_show("VIBR 3/4", "Regular")
     print(f"    Block 3: regular {freq}Hz")
     play_haptic_block(drv, h_regular, blocktime)
 
+    logger.log_block(trial_num, 'vib', '', 4)
     lcd_show("VIBR 4/4", "Silent")
     print(f"    Block 4: no vibration")
     time.sleep(blocktime)
-
-    play_word(words, 'rest')
-
-
-def run_trial_simultaneous(blocktime: float, freq: float, template: list,
-                            words: dict,
-                            effect1: int = DEFAULT_EFFECT1,
-                            effect2: int = DEFAULT_EFFECT2):
-    """SIMULTANEOUS trial — sound + haptic together per block."""
-    drv = _drv
-
-    print("    Precomputing sound+haptic...", flush=True)
-    w_arrhythm = build_arrhythmic_sound_from_template(template, blocktime)
-    w_regular  = build_regular_sound(blocktime, freq)
-    w_silent   = _silence(blocktime)
-    h_arrhythm = template_to_haptic_events(template, effect1, effect2) if drv else []
-    h_regular  = build_regular_haptic(blocktime, freq, effect1, effect2) if drv else []
-
-    lcd_show("SIMUL", "Get ready...")
-    play_word(words, 'ready')
-    jitter = random.uniform(-0.5, 0.5)
-    time.sleep(max(0.5, 2.0 + jitter))
-    play_word(words, 'walk')
-
-    lcd_show("SIMUL 1/4", "Arrhythmic")
-    print(f"    Block 1: arrhythmic simultaneous")
-    if drv:
-        play_simultaneous(drv, w_arrhythm, h_arrhythm, blocktime)
-    else:
-        play_audio(w_arrhythm)
-
-    lcd_show("SIMUL 2/4", "Silent")
-    print(f"    Block 2: silent")
-    play_audio(w_silent)
-
-    lcd_show("SIMUL 3/4", "Regular")
-    print(f"    Block 3: regular simultaneous")
-    if drv:
-        play_simultaneous(drv, w_regular, h_regular, blocktime)
-    else:
-        play_audio(w_regular)
-
-    lcd_show("SIMUL 4/4", "Silent")
-    print(f"    Block 4: silent")
-    play_audio(w_silent)
 
     play_word(words, 'rest')
 
@@ -809,15 +753,6 @@ def main():
     lcd_show(f"{total_trials} trials", f"~{est_minutes:.0f} min total")
     time.sleep(2)
 
-    # ── Optional simultaneous test ───────────────────────────────────────
-    if args.simtest:
-        lcd_show("Simul. test", "Sound + Haptic")
-        run_trial_simultaneous(blocktime, freq, templates[0], words,
-                               effect1, effect2)
-        if not wait_for_continue():
-            keypad_close()
-            return
-
     # ── Trial loop ───────────────────────────────────────────────────────
     for idx, modality in enumerate(modalities):
         tpl_idx   = template_order[idx % NUM_TEMPLATES]
@@ -832,29 +767,19 @@ def main():
         lcd_show(f"Trial {trial_num}/{total_trials}",
                  f"{modality} T#{tpl_idx}")
 
-        t_start = datetime.now().isoformat()
         t0      = time.perf_counter()
 
         if modality == 'sound':
-            run_trial_sound(blocktime, freq, template, words)
+            run_trial_sound(blocktime, freq, template, words,
+                            logger, trial_num, tpl_idx)
         elif modality == 'vibration':
             run_trial_vibration(blocktime, freq, template, words,
+                                logger, trial_num, tpl_idx,
                                 effect1, effect2)
         else:
-            run_trial_simultaneous(blocktime, freq, template, words,
-                                   effect1, effect2)
+            print(f"  [ERROR] Unknown modality '{modality}' — skipping trial")
 
-        t_end   = datetime.now().isoformat()
         elapsed = time.perf_counter() - t0
-
-        logger.log_trial(
-            trial_num=trial_num,
-            modality=modality,
-            template_index=tpl_idx,
-            template_onsets=template,
-            trial_start=t_start,
-            trial_end=t_end,
-        )
 
         print(f"  Trial {trial_num} done ({elapsed:.1f}s)")
         lcd_show("Rest", "# next  * quit")
@@ -890,8 +815,6 @@ def parse_args():
                    choices=['sound', 'vibration'])
     p.add_argument('--effect1',     type=int,   default=DEFAULT_EFFECT1)
     p.add_argument('--effect2',     type=int,   default=DEFAULT_EFFECT2)
-    p.add_argument('--simtest',     action='store_true',
-                   help='Run simultaneous test before experiment')
     p.add_argument('--list-devices', action='store_true')
     return p.parse_args()
 

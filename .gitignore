@@ -14,6 +14,7 @@
 *.mat
 *.stats
 *.csv
+*.txt
 
 # Vosk models
 rpi_workshop/vosk_models/
