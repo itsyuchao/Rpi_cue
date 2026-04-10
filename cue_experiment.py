@@ -13,7 +13,7 @@ Hardware
 
 Trial structure (4 sub-blocks × blocktime s each)
 --------------------------------------------------
-  'ready.wav' → pause → 'walk.wav' →
+  'ready.wav' → pause → 'ignore.wav' →
   Block 1 — Arrhythmic  : random beats from 20 pre-generated templates
   Block 2 — Silent      : no cue
   Block 3 — Regular     : steady alternating cue at freq Hz
@@ -84,17 +84,21 @@ HARMONICS  = [(1, 1.00), (2, 0.30), (3, 0.15), (4, 0.10)]
 TONE_DURATION = 0.15
 
 # Arrhythmic timing — both inter-pair AND intra-pair randomised
-ARHYTHM_INTER_MIN   = 0.2
-ARHYTHM_INTER_MAX   = 0.8
-ARHYTHM_INTRA_MIN = 0.2
-ARHYTHM_INTRA_MAX = 0.8 
+ARHYTHM_INTER_MIN   = 0.1
+ARHYTHM_INTER_MAX   = 0.9
+ARHYTHM_INTRA_MIN = 0.1
+ARHYTHM_INTRA_MAX = 0.9 
 
 # Templates
 NUM_TEMPLATES = 20
+TEMPLATE_CSV_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    'templates.csv'
+)
 
 # Haptic effects (DRV2605 built-in library)
 DEFAULT_EFFECT1 = 1    # Strong Click → "low" beat
-DEFAULT_EFFECT2 = 47   # Sharp Tick   → "high" beat
+DEFAULT_EFFECT2 = 14   # Strong Buzz   → "high" beat
 
 # Keypad GPIO (left→right on ribbon: 23,24,25,8,7,1,12,16)
 KEYPAD_ROWS_PINS = [23, 24, 25, 8]
@@ -276,7 +280,7 @@ def audio_init():
 
 def load_wav(path: str) -> np.ndarray:
     """Load WAV → float32 mono at SR."""
-    sr_in, data = wav.read(path)
+    sr_in, data = wav.read(f"audio/{path}")
     if data.dtype == np.int16:
         data = data.astype(np.float32) / 32768.0
     elif data.dtype == np.int32:
@@ -377,30 +381,37 @@ def build_arrhythmic_sound_from_template(template: list,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 7 — Arrhythmic template generator
+# Module 7 — Arrhythmic template loader
 # ══════════════════════════════════════════════════════════════════════════════
 
-def generate_arrhythmic_templates(n: int, blocktime_s: float) -> list[list]:
-    """
-    Pre-generate n unique arrhythmic timing templates.
-    Each template = list of (onset_s, intra_gap_s).
-    Both inter-pair ISI and intra-pair gap are randomised.
-    """
-    templates     = []
-    base_tone_dur = TONE_DURATION
+def load_arrhythmic_templates(path: str,
+                              expected_n: int,
+                              blocktime_s: float) -> list[list]:
+    """Load templates from CSV file with tolerant parsing."""
+    del blocktime_s  # kept for call compatibility
+    templates = [[] for _ in range(expected_n)]
+    rows_by_template = {i: [] for i in range(expected_n)}
 
-    for _ in range(n):
-        events = []
-        t = random.uniform(0.1, 0.6) # add small jitter at the start 
-        while True:
-            intra_gap = random.uniform(ARHYTHM_INTRA_MIN, ARHYTHM_INTRA_MAX)
-            pair_dur  = base_tone_dur + intra_gap + base_tone_dur
-            if  t + pair_dur > blocktime_s:
-                break
-            events.append((round(t, 4), round(intra_gap, 4)))
-            isi = random.uniform(ARHYTHM_INTER_MIN, ARHYTHM_INTER_MAX)
-            t  += isi
-        templates.append(events)
+    with open(path, newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                tpl_idx = int(row.get('template_index', ''))
+                pair_idx = int(row.get('pair_index', ''))
+                onset = float(row.get('onset_s', ''))
+                intra_gap = float(row.get('intra_gap_s', ''))
+            except (TypeError, ValueError):
+                continue
+
+            if 0 <= tpl_idx < expected_n:
+                rows_by_template[tpl_idx].append((pair_idx, onset, intra_gap))
+
+    for tpl_idx in range(expected_n):
+        rows = sorted(rows_by_template[tpl_idx], key=lambda x: x[0])
+        templates[tpl_idx] = [
+            (round(onset, 4), round(intra_gap, 4))
+            for _, onset, intra_gap in rows
+        ]
 
     return templates
 
@@ -433,8 +444,7 @@ def haptic_init():
         i2c  = busio.I2C(board.SCL, board.SDA)
         _drv = adafruit_drv2605.DRV2605(i2c)
         _drv.use_LRM()
-        _drv.library = 6
-        print("Haptic: DRV2605L initialised (LRA, library 6)")
+        print("Haptic: DRV2605L initialised (LRA)")
     except Exception as e:
         print(f"WARNING: DRV2605 init failed — {e}")
         _drv = None
@@ -464,6 +474,13 @@ def play_haptic_block(drv, events: list, total_s: float):
     remaining = total_s - (time.perf_counter() - t0)
     if remaining > 0:
         time.sleep(remaining)
+
+
+def play_haptic_event(drv, effect_id: int): 
+    drv.sequence[0] = adafruit_drv2605.Effect(effect_id)
+    drv.play()
+    time.sleep(1)
+    drv.stop()
 
 
 def build_regular_haptic(blocktime_s: float, freq_hz: float,
@@ -496,23 +513,36 @@ class ExperimentLogger:
         'block_type',
         'template_number',
         'block_number_in_trial',
+        'sync_rating',
     ]
 
-    def __init__(self, participant_id: str, output_dir: str = '.'):
+    def __init__(self, participant_id: str, output_dir: str = 'log'):
         self.pid = participant_id
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        os.makedirs(output_dir, exist_ok=True)
         self.filename = os.path.join(
             output_dir, f"cue_log_{participant_id}_{ts}.csv"
         )
         with open(self.filename, 'w', newline='') as f:
             csv.writer(f).writerow(self.HEADER)
+            f.flush()
+            os.fsync(f.fileno())
         print(f"Logger: {self.filename}")
 
+    def _append_row(self, row: list):
+        with open(self.filename, 'a', newline='') as f:
+            csv.writer(f).writerow(row)
+            f.flush()
+            os.fsync(f.fileno())
+
     def log_block(self, trial_num: int, block_type: str,
-                  template_number: int | str, block_number_in_trial: int):
-        block_start_time_utc = datetime.now(timezone.utc).isoformat(
-            timespec='microseconds'
-        )
+                  template_number: int | str, block_number_in_trial: int,
+                  sync_rating: int | str = '',
+                  block_start_time_utc: str | None = None):
+        if block_start_time_utc is None:
+            block_start_time_utc = datetime.now(timezone.utc).isoformat(
+                timespec='microseconds'
+            )
         row = [
             self.pid,
             trial_num,
@@ -520,9 +550,9 @@ class ExperimentLogger:
             block_type,
             template_number,
             block_number_in_trial,
+            sync_rating,
         ]
-        with open(self.filename, 'a', newline='') as f:
-            csv.writer(f).writerow(row)
+        self._append_row(row)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -531,13 +561,13 @@ class ExperimentLogger:
 
 def run_trial_sound(blocktime: float, freq: float, template: list,
                      words: dict, logger: ExperimentLogger,
-                     trial_num: int, template_index: int):
+                     trial_num: int, template_index: int, attend_high: bool=True):
     """
     SOUND trial — 4 blocks:
       'ready' → pause → 'walk' →
       Block 1: arrhythmic → Block 2: silent →
       Block 3: regular    → Block 4: silent →
-      'rest'
+      'ratesync'
     """
     print("    Precomputing waveforms...", flush=True)
     w_arrhythm = build_arrhythmic_sound_from_template(template, blocktime)
@@ -546,9 +576,11 @@ def run_trial_sound(blocktime: float, freq: float, template: list,
 
     lcd_show("SOUND", "Get ready...")
     play_word(words, 'ready')
+    time.sleep(0.5)
+    play_word(words, 'pause')
     jitter = random.uniform(-0.5, 0.5)
     time.sleep(max(0.5, 2.0 + jitter))
-    play_word(words, 'walk')
+    play_word(words, 'ignore')
 
     logger.log_block(trial_num, 'sound', template_index, 1)
     lcd_show("SOUND 1/4", "Arrhythmic")
@@ -560,30 +592,47 @@ def run_trial_sound(blocktime: float, freq: float, template: list,
     print(f"    Block 2: silent")
     play_audio(w_silent)
 
+    play_word(words, 'attendhigh' if attend_high else 'attendlow')
+    time.sleep(0.5)
+    play_audio(_synth_tone(F_HIGH if attend_high else F_LOW, 0.5))
+    time.sleep(2)
+
     logger.log_block(trial_num, 'sound', '', 3)
     lcd_show("SOUND 3/4", "Regular")
     print(f"    Block 3: regular {freq}Hz")
     play_audio(w_regular)
 
-    logger.log_block(trial_num, 'sound', '', 4)
+    block4_start_time_utc = datetime.now(timezone.utc).isoformat(
+        timespec='microseconds'
+    )
     lcd_show("SOUND 4/4", "Silent")
     print(f"    Block 4: silent")
     play_audio(w_silent)
 
-    play_word(words, 'rest')
+    play_word(words, 'ratesync')
+    sync_rating = get_sync_rating()
+    logger.log_block(
+        trial_num,
+        'sound',
+        '',
+        4,
+        sync_rating=sync_rating,
+        block_start_time_utc=block4_start_time_utc,
+    )
 
 
 def run_trial_vibration(blocktime: float, freq: float, template: list,
                          words: dict, logger: ExperimentLogger,
                          trial_num: int, template_index: int,
                          effect1: int = DEFAULT_EFFECT1,
-                         effect2: int = DEFAULT_EFFECT2):
+                         effect2: int = DEFAULT_EFFECT2, 
+                         attend_high: bool=True):
     """
     VIBRATION trial — 4 blocks:
       'ready' → pause → 'walk' →
       Block 1: arrhythmic haptic → Block 2: silent →
       Block 3: regular haptic    → Block 4: silent →
-      'rest'
+      'ratesync'
     """
     drv = _drv
     if drv is None:
@@ -597,9 +646,11 @@ def run_trial_vibration(blocktime: float, freq: float, template: list,
 
     lcd_show("VIBRATION", "Get ready...")
     play_word(words, 'ready')
+    time.sleep(0.5)
+    play_word(words, 'pause')
     jitter = random.uniform(-0.5, 0.5)
     time.sleep(max(0.5, 2.0 + jitter))
-    play_word(words, 'walk')
+    play_word(words, 'ignore')
 
     logger.log_block(trial_num, 'vib', template_index, 1)
     lcd_show("VIBR 1/4", "Arrhythmic")
@@ -611,17 +662,33 @@ def run_trial_vibration(blocktime: float, freq: float, template: list,
     print(f"    Block 2: no vibration")
     time.sleep(blocktime)
 
+    play_word(words, 'attendclick' if attend_high else 'attendbuzz')
+    time.sleep(1)
+    play_haptic_event(drv, effect1 if attend_high else effect2)
+    time.sleep(2)
+
     logger.log_block(trial_num, 'vib', '', 3)
     lcd_show("VIBR 3/4", "Regular")
     print(f"    Block 3: regular {freq}Hz")
     play_haptic_block(drv, h_regular, blocktime)
 
-    logger.log_block(trial_num, 'vib', '', 4)
+    block4_start_time_utc = datetime.now(timezone.utc).isoformat(
+        timespec='microseconds'
+    )
     lcd_show("VIBR 4/4", "Silent")
     print(f"    Block 4: no vibration")
     time.sleep(blocktime)
 
-    play_word(words, 'rest')
+    play_word(words, 'ratesync')
+    sync_rating = get_sync_rating()
+    logger.log_block(
+        trial_num,
+        'vib',
+        '',
+        4,
+        sync_rating=sync_rating,
+        block_start_time_utc=block4_start_time_utc,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -658,6 +725,105 @@ def wait_for_continue() -> bool:
                 return False
 
 
+def get_sync_rating() -> int:
+    """Collect a 1-5 sync rating after ratesync."""
+    if KEYPAD_AVAILABLE and _kp_rows is not None:
+        lcd_show("Sync rating", "1-5")
+        while True:
+            key = keypad_wait()
+            if key in ('1', '2', '3', '4', '5'):
+                return int(key)
+    else:
+        while True:
+            try:
+                val = input("  >> Sync rating (1-5): ").strip()
+            except EOFError:
+                return 0
+            if val in {'1', '2', '3', '4', '5'}:
+                return int(val)
+
+
+def get_resume_start_index(blocknum: int, total_trials: int,
+                           has_two_blocks: bool) -> int:
+    """Prompt resume position and return 0-based trial index to start from."""
+    if KEYPAD_AVAILABLE and _kp_rows is not None:
+        lcd_show("Resume session?", "1=yes 0=no")
+        while True:
+            key = keypad_wait()
+            if key == '0':
+                return 0
+            if key == '1':
+                break
+
+        block = 'a'
+        if has_two_blocks:
+            lcd_show("Which block", "A or B")
+            while True:
+                key = keypad_wait()
+                if key in ('A', 'B'):
+                    block = key.lower()
+                    break
+
+        trial_str = keypad_input_string("Trial number:", max_len=4)
+        try:
+            trial_num = int(trial_str)
+        except ValueError:
+            return 0
+    else:
+        ans = input("Resume previous session? (1/0): ").strip()
+        if ans != '1':
+            return 0
+
+        block = 'a'
+        if has_two_blocks:
+            block = input("Which block (a/b): ").strip().lower()
+
+        try:
+            trial_num = int(input("Which trial number: ").strip())
+        except ValueError:
+            return 0
+
+    if trial_num < 1 or trial_num > blocknum:
+        return 0
+    if block not in ('a', 'b'):
+        return 0
+
+    start_idx = (trial_num - 1) if block == 'a' else (blocknum + trial_num - 1)
+    if start_idx < 0 or start_idx >= total_trials:
+        return 0
+    return start_idx
+
+
+def build_trial_plan(blocknum: int,
+                     randomize: bool,
+                     firstblock: str,
+                     participant_id: str) -> tuple[list[str], list[bool], str]:
+    """Build modality and attention schedules from one participant-seeded RNG."""
+    rng = random.Random(f"participant::{participant_id}")
+
+    if randomize:
+        modalities = [rng.choice(['sound', 'vibration']) for _ in range(blocknum)]
+        mode_desc = f"randomized-seeded ({blocknum} trials)"
+    else:
+        first = firstblock
+        other = 'vibration' if first == 'sound' else 'sound'
+        modalities = [first] * blocknum + [other] * blocknum
+        mode_desc = f"{first} x{blocknum} then {other} x{blocknum}"
+
+    total_trials = len(modalities)
+    n_high = total_trials // 2
+    n_low = total_trials // 2
+    if total_trials % 2 == 1:
+        if rng.choice([True, False]):
+            n_high += 1
+        else:
+            n_low += 1
+
+    attention_schedule = [True] * n_high + [False] * n_low
+    rng.shuffle(attention_schedule)
+    return modalities, attention_schedule, mode_desc
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Module 13 — Main experiment
 # ══════════════════════════════════════════════════════════════════════════════
@@ -692,10 +858,26 @@ def main():
     effect1   = args.effect1
     effect2   = args.effect2
 
-    # ── Generate 20 arrhythmic templates ─────────────────────────────────
-    print(f"\nGenerating {NUM_TEMPLATES} arrhythmic templates "
-          f"({blocktime}s each)...")
-    templates = generate_arrhythmic_templates(NUM_TEMPLATES, blocktime)
+    # ── Load templates from fixed CSV ─────────────────────────────────────
+    print(f"\nLoading {NUM_TEMPLATES} arrhythmic templates from "
+          f"{TEMPLATE_CSV_PATH} ({blocktime}s each)...")
+    try:
+        templates = load_arrhythmic_templates(
+            TEMPLATE_CSV_PATH,
+            NUM_TEMPLATES,
+            blocktime,
+        )
+    except FileNotFoundError:
+        print("ERROR: templates.csv not found.")
+        print("Run: python3 generate_templates.py --blocktime "
+              f"{blocktime} --num-templates {NUM_TEMPLATES}")
+        keypad_close()
+        return
+    except Exception as e:
+        print(f"ERROR: failed to load templates.csv — {e}")
+        print("Regenerate with: python3 generate_templates.py")
+        keypad_close()
+        return
     for i, tpl in enumerate(templates):
         if tpl:
             print(f"  Template {i:2d}: {len(tpl)} pairs, "
@@ -703,29 +885,30 @@ def main():
         else:
             print(f"  Template {i:2d}: empty")
 
-    # Shuffle order — no repetition within first 20 trials
+    # No shuffling order for now since templates are already randomised
     template_order = list(range(NUM_TEMPLATES))
-    random.shuffle(template_order)
+    # random.shuffle(template_order)
 
     # ── Build modality sequence ──────────────────────────────────────────
-    if args.randomize:
-        modalities = [random.choice(['sound', 'vibration'])
-                      for _ in range(blocknum)]
-        mode_desc  = f"randomized ({blocknum} trials)"
-    else:
-        first = args.firstblock
-        other = 'vibration' if first == 'sound' else 'sound'
-        modalities = [first] * blocknum + [other] * blocknum
-        mode_desc  = f"{first} x{blocknum} then {other} x{blocknum}"
+    modalities, attention_schedule, mode_desc = build_trial_plan(
+        blocknum,
+        args.randomize,
+        args.firstblock,
+        participant_id,
+    )
 
     total_trials = len(modalities)
+    has_two_blocks = not args.randomize
+    start_idx = get_resume_start_index(blocknum, total_trials, has_two_blocks)
+    if start_idx > 0:
+        print(f"Resuming from trial {start_idx + 1}/{total_trials}")
 
     # ── Logger ───────────────────────────────────────────────────────────
     logger = ExperimentLogger(participant_id)
 
     # ── Pre-load WAV cues ────────────────────────────────────────────────
     words = {}
-    for name in ['ready', 'walk', 'rest']:
+    for name in ['ready', 'pause', 'ignore', 'attendhigh', 'attendlow', 'attendclick', 'attendbuzz', 'ratesync']:
         try:
             words[name] = load_wav(f'{name}.wav')
             print(f"Loaded {name}.wav ({len(words[name])/SR:.2f}s)")
@@ -754,44 +937,55 @@ def main():
     time.sleep(2)
 
     # ── Trial loop ───────────────────────────────────────────────────────
-    for idx, modality in enumerate(modalities):
-        tpl_idx   = template_order[idx % NUM_TEMPLATES]
-        template  = templates[tpl_idx]
-        trial_num = idx + 1
+    interrupted = False
+    try:
+        for idx in range(start_idx, total_trials):
+            modality  = modalities[idx]
+            tpl_idx   = template_order[idx % NUM_TEMPLATES]
+            template  = templates[tpl_idx]
+            trial_num = idx + 1
 
-        print(f"\n{'─'*50}")
-        print(f"  Trial {trial_num}/{total_trials}  "
-              f"[{modality.upper()}]  template #{tpl_idx}")
-        print(f"{'─'*50}")
+            print(f"\n{'─'*50}")
+            print(f"  Trial {trial_num}/{total_trials}  "
+                  f"[{modality.upper()}]  template #{tpl_idx}")
+            print(f"{'─'*50}")
 
-        lcd_show(f"Trial {trial_num}/{total_trials}",
-                 f"{modality} T#{tpl_idx}")
+            lcd_show(f"Trial {trial_num}/{total_trials}",
+                     f"{modality} T#{tpl_idx}")
 
-        t0      = time.perf_counter()
+            t0 = time.perf_counter()
 
-        if modality == 'sound':
-            run_trial_sound(blocktime, freq, template, words,
-                            logger, trial_num, tpl_idx)
-        elif modality == 'vibration':
-            run_trial_vibration(blocktime, freq, template, words,
+            if modality == 'sound':
+                run_trial_sound(blocktime, freq, template, words,
                                 logger, trial_num, tpl_idx,
-                                effect1, effect2)
-        else:
-            print(f"  [ERROR] Unknown modality '{modality}' — skipping trial")
+                                attend_high=attention_schedule[idx])
+            elif modality == 'vibration':
+                run_trial_vibration(blocktime, freq, template, words,
+                                    logger, trial_num, tpl_idx,
+                                    effect1, effect2,
+                                    attend_high=attention_schedule[idx])
+            else:
+                print(f"  [ERROR] Unknown modality '{modality}' — skipping trial")
 
-        elapsed = time.perf_counter() - t0
+            elapsed = time.perf_counter() - t0
 
-        print(f"  Trial {trial_num} done ({elapsed:.1f}s)")
-        lcd_show("Rest", "# next  * quit")
+            print(f"  Trial {trial_num} done ({elapsed:.1f}s)")
+            lcd_show("Rest", "# next  * quit")
 
-        if idx < total_trials - 1:
-            if not wait_for_continue():
-                break
+            if idx < total_trials - 1:
+                if not wait_for_continue():
+                    break
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nInterrupted by user (Ctrl+C). Logged rows were flushed to disk.")
 
     # ── Done ─────────────────────────────────────────────────────────────
-    lcd_show("Experiment", "Complete!")
+    lcd_show("Experiment", "Interrupted" if interrupted else "Complete!")
     print(f"\n{'='*60}")
-    print(f"Experiment complete — {logger.filename}")
+    if interrupted:
+        print(f"Experiment interrupted — {logger.filename}")
+    else:
+        print(f"Experiment complete — {logger.filename}")
     print(f"{'='*60}")
     time.sleep(3)
     lcd_show("", "")
