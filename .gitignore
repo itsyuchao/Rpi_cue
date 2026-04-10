@@ -13,6 +13,7 @@
 *.ie
 *.mat
 *.stats
+*.csv
 
 # Vosk models
 rpi_workshop/vosk_models/

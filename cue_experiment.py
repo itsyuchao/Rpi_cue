@@ -85,10 +85,10 @@ HARMONICS  = [(1, 1.00), (2, 0.30), (3, 0.15), (4, 0.10)]
 TONE_DUTY  = 0.3
 
 # Arrhythmic timing — both inter-pair AND intra-pair randomised
-ARHYTHM_ISI_MIN   = 0.35
-ARHYTHM_ISI_MAX   = 1.20
-ARHYTHM_INTRA_MIN = 0.08
-ARHYTHM_INTRA_MAX = 0.35
+ARHYTHM_ISI_MIN   = 0.1
+ARHYTHM_ISI_MAX   = 0.9
+ARHYTHM_INTRA_MIN = 0.1
+ARHYTHM_INTRA_MAX = 0.9
 
 # Templates
 NUM_TEMPLATES = 20
