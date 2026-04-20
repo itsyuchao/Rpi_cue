@@ -93,12 +93,12 @@ def auto_calibrate(drv):
 
     # 2. Set rated voltage — adjust for YOUR LRA's datasheet value
     #    Formula: V_rated = register_val * 21.33e-3
-    rated_v = 0x3E   # ~1.3 Vrms — safe starting point
+    rated_v = 0x56   # ~1.8 Vrms — safe starting point
     write_reg(drv, REG_RATED_V, rated_v)
     print(f"  RATED_VOLTAGE (0x16) = 0x{rated_v:02X}  (~{rated_v * 21.33e-3:.2f} Vrms)")
 
     # 3. Set overdrive clamp voltage
-    clamp_v = 0x8C   # ~3.0V
+    clamp_v = 0xA5   # ~3.5V
     write_reg(drv, REG_CLAMP_V, clamp_v)
     print(f"  CLAMP_VOLTAGE (0x17) = 0x{clamp_v:02X}  (~{clamp_v * 21.33e-3:.2f} V)")
 
@@ -279,8 +279,7 @@ if __name__ == "__main__":
     i2c = busio.I2C(board.SCL, board.SDA)
     drv = adafruit_drv2605.DRV2605(i2c)
     drv.use_LRM()
-    drv.library = 6
-    print("Configured: LRA mode, library 6\n")
+    print("Configured: LRA mode\n")
 
     try:
         # 1) Auto-calibration
