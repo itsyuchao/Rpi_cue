@@ -6,10 +6,15 @@ Rhythmic cueing experiment controller for Raspberry Pi 4.
 
 Hardware
 --------
-  Sound  : PCM5102A breakout → I2S (BCLK=GPIO18, LRCLK=GPIO19, DIN=GPIO21)
+  Audio  : PCM5102A breakout → I2S (BCLK=GPIO18, LRCLK=GPIO19, DIN=GPIO21)
   Haptic : DRV2605L → I2C 0x5a, LRA motor
-  LCD    : 16×2 I2C LCD → I2C 0x27 (lcd_i2c driver)
-  Keypad : 4×4 membrane → GPIO 23,24,25,8 (rows) / 7,1,12,16 (cols)
+
+Operator console
+----------------
+  All operator I/O (subject ID, resume prompt, between-trial continue,
+  sync rating) goes through the controlling terminal. An RF-dongle USB
+  keyboard plugs into this Pi for that purpose; there is no on-Pi
+  LCD/OLED or membrane keypad.
 
 Trial structure (5 sub-blocks × blocktime s each)
 -------------------------------------------------
@@ -29,14 +34,27 @@ Trial structure (5 sub-blocks × blocktime s each)
   The attention cue ('attendhigh'/'attendlow' or 'attendclick'/'attendbuzz')
   always plays immediately before the regular block.
 
-  After the final silent block, 'ratesync.wav' plays and the participant
-  gives a 1-5 keypad rating.
+  After the final silent block, 'ratesync.wav' plays and the operator
+  enters a 1-5 sync rating at the terminal.
+
+Per-block network protocol
+--------------------------
+  For each sub-block the order is **always**:
+    1. Three ping-pong rounds against rpi-fetch (warms the network path,
+       logged as a 'ping' row in this Pi's cue_log).
+    2. Capture block-start recv_time_iso + recv_perf_s and emit the marker
+       UDP packet on the now-warm path.
+    3. Begin stimulation.
+
+  Putting the volley before the marker emit gives the marker packet the
+  lowest-latency, highest-reliability slot in the sequence. Column names
+  (recv_time_iso, recv_perf_s) match the fetch CSV so cross-Pi alignment
+  works on a single pair of column names.
 
 Install
 -------
   pip install numpy sounddevice scipy \
-              adafruit-blinka adafruit-circuitpython-drv2605
-  # lcd_i2c and gpiozero come with Raspberry Pi OS
+              adafruit-circuitpython-drv2605
 """
 
 import argparse
@@ -52,20 +70,113 @@ import scipy.io.wavfile as wav
 
 import socket as _socket
 
+# Marker UDP + three-round latency ping — rpi-stim initiates, rpi-fetch responds.
+# Each block runs ping_volley() (three ping-pongs, logged as a 'ping' row) and
+# then send_marker_packet() to emit the marker. The volley warms the network
+# path so the marker UDP arrives with the lowest possible latency.
+
+_UDP_PING_PORT   = 5006
+_PING_K          = 42
+_PING_MOD        = 65536
+_PING_TIMEOUT_S  = 0.5
+
 _marker_sock: _socket.socket | None = None
 _marker_addr: tuple | None = None
+_ping_sock: _socket.socket | None = None
+_ping_addr: tuple | None = None
+_ping_nonce: int = 0
+_logger = None  # ExperimentLogger, set by marker_init
 
-def marker_init(host: str, port: int = 5005):
-    global _marker_sock, _marker_addr
+
+def marker_init(host: str, port: int = 5005,
+                ping_port: int = _UDP_PING_PORT,
+                logger=None):
+    """Open marker + ping sockets to `host`; ping rows are appended to `logger`."""
+    global _marker_sock, _marker_addr, _ping_sock, _ping_addr, _logger
     _marker_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
     _marker_addr = (host, port)
+    _ping_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    _ping_sock.settimeout(_PING_TIMEOUT_S)
+    _ping_addr = (host, ping_port)
+    _logger = logger
 
-def send_marker(label: str):
-    if _marker_sock and _marker_addr:
-        try:
-            _marker_sock.sendto(label.encode(), _marker_addr)
-        except OSError:
-            pass
+
+def _drain_ping_sock() -> None:
+    """Discard any leftover pong packets from earlier rounds."""
+    if _ping_sock is None:
+        return
+    _ping_sock.setblocking(False)
+    try:
+        while True:
+            _ping_sock.recvfrom(128)
+    except (BlockingIOError, OSError):
+        pass
+    finally:
+        _ping_sock.settimeout(_PING_TIMEOUT_S)
+
+
+def _one_ping(label: str) -> str:
+    """One ping-pong round. Returns RTT in ms as a string, or an error tag."""
+    global _ping_nonce
+    if _ping_sock is None or _ping_addr is None:
+        return "noinit"
+    _ping_nonce = (_ping_nonce + 1) % _PING_MOD
+    nonce    = _ping_nonce
+    expected = (nonce + _PING_K) % _PING_MOD
+    payload  = f"PING:{nonce}:{label}".encode("ascii")
+
+    _drain_ping_sock()
+    t0 = time.perf_counter()
+    try:
+        _ping_sock.sendto(payload, _ping_addr)
+        data, _ = _ping_sock.recvfrom(128)
+        t1 = time.perf_counter()
+    except _socket.timeout:
+        return "timeout"
+    except OSError as e:
+        return f"err:{e.errno}"
+
+    parts = data.decode("ascii", errors="ignore").strip().split(":", 2)
+    if len(parts) < 3 or parts[0] != "PONG":
+        return "bad"
+    try:
+        got = int(parts[1])
+    except ValueError:
+        return "bad"
+    if got != expected or parts[2] != label:
+        return "mismatch"
+    return f"{(t1 - t0) * 1000.0:.3f}"
+
+
+def ping_volley(label: str, trial_num: int | str = ''):
+    """Run three ping-pong rounds against rpi-fetch and log the RTTs.
+
+    This is the first step of every block — it warms the network path
+    so the subsequent send_marker_packet() emits onto a hot route. The
+    'ping' row is timestamped at the start of the volley; the matching
+    'block' row (logged separately) carries the post-volley timestamps.
+    """
+    if _ping_sock is None or _ping_addr is None:
+        return
+    ping_iso  = datetime.now(timezone.utc).isoformat(timespec='microseconds')
+    ping_perf = time.perf_counter()
+    rtts = [_one_ping(label) for _ in range(3)]
+    if _logger is not None:
+        _logger.log_ping(
+            marker_label=label, trial_num=trial_num,
+            recv_time_iso=ping_iso, recv_perf_s=ping_perf, rtts=rtts,
+        )
+
+
+def send_marker_packet(label: str):
+    """Emit a single marker UDP packet. Caller must have run ping_volley()
+    immediately beforehand so the network path is warm."""
+    if _marker_sock is None or _marker_addr is None:
+        return
+    try:
+        _marker_sock.sendto(label.encode(), _marker_addr)
+    except OSError:
+        pass
 
 
 logger_ip = "192.168.50.5"
@@ -82,22 +193,6 @@ try:
 except ImportError:
     HAPTIC_AVAILABLE = False
     print("INFO: adafruit_drv2605 not found — haptic output disabled")
-
-# LCD
-try:
-    from lcd_i2c import LCD_I2C
-    LCD_AVAILABLE = True
-except ImportError:
-    LCD_AVAILABLE = False
-    print("INFO: lcd_i2c not found — LCD output disabled")
-
-# Keypad
-try:
-    from gpiozero import DigitalOutputDevice, Button
-    KEYPAD_AVAILABLE = True
-except ImportError:
-    KEYPAD_AVAILABLE = False
-    print("INFO: gpiozero not found — keypad input disabled")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -136,169 +231,9 @@ TEMPLATE_CSV_PATH = os.path.join(
 DEFAULT_EFFECT1 = 1    # Strong Click → "low" beat
 DEFAULT_EFFECT2 = 14   # Strong Buzz   → "high" beat
 
-# Keypad GPIO (left→right on ribbon: 23,24,25,8,7,1,12,16)
-KEYPAD_ROWS_PINS = [23, 24, 25, 8]
-KEYPAD_COLS_PINS = [7, 1, 12, 16]
-KEYPAD_KEYS = [
-    "1", "2", "3", "A",
-    "4", "5", "6", "B",
-    "7", "8", "9", "C",
-    "*", "0", "#", "D",
-]
-
-# LCD
-LCD_I2C_ADDR = 0x27
-LCD_COLS     = 16
-LCD_ROWS     = 2
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 3 — LCD driver
-# ══════════════════════════════════════════════════════════════════════════════
-
-_lcd = None
-
-
-def lcd_init():
-    """Initialise the 16×2 I2C LCD."""
-    global _lcd
-    if not LCD_AVAILABLE:
-        return
-    try:
-        _lcd = LCD_I2C(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS)
-        _lcd.backlight.on()
-        _lcd.clear()
-        print(f"LCD: 16x2 at I2C 0x{LCD_I2C_ADDR:02x}")
-    except Exception as e:
-        print(f"WARNING: LCD init failed — {e}")
-        _lcd = None
-
-
-def lcd_show(line1: str = "", line2: str = ""):
-    """Write two lines to LCD. Falls back to terminal if no LCD."""
-    if _lcd is None:
-        print(f"  LCD| {line1[:LCD_COLS]:<{LCD_COLS}}")
-        print(f"  LCD| {line2[:LCD_COLS]:<{LCD_COLS}}")
-        return
-    try:
-        _lcd.clear()
-        _lcd.cursor.setPos(0, 0)
-        _lcd.write_text(line1[:LCD_COLS].ljust(LCD_COLS))
-        _lcd.cursor.setPos(1, 0)
-        _lcd.write_text(line2[:LCD_COLS].ljust(LCD_COLS))
-    except Exception as e:
-        print(f"  LCD write error: {e}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Module 4 — Keypad driver
-# ══════════════════════════════════════════════════════════════════════════════
-
-_kp_rows = None
-_kp_cols = None
-
-
-def keypad_init():
-    """Initialise keypad GPIO pins."""
-    global _kp_rows, _kp_cols
-    if not KEYPAD_AVAILABLE:
-        return
-    if _kp_rows is not None:
-        return
-    _kp_rows = [DigitalOutputDevice(pin) for pin in KEYPAD_ROWS_PINS]
-    _kp_cols = [Button(pin, pull_up=False) for pin in KEYPAD_COLS_PINS]
-    print("Keypad: 4x4 matrix initialised")
-
-
-def keypad_scan() -> str | None:
-    """Single scan. Returns key char or None."""
-    if _kp_rows is None:
-        return None
-    for i, row in enumerate(_kp_rows):
-        row.on()
-        for j, col in enumerate(_kp_cols):
-            if col.is_pressed:
-                row.off()
-                return KEYPAD_KEYS[i * 4 + j]
-        row.off()
-    return None
-
-
-def keypad_wait(timeout: float = None) -> str | None:
-    """Block until a key is pressed and released. Debounced."""
-    last = None
-    start = time.monotonic()
-    while True:
-        key = keypad_scan()
-        if key and key != last:
-            time.sleep(0.05)
-            if keypad_scan() == key:
-                while keypad_scan() == key:
-                    time.sleep(0.02)
-                return key
-        last = key
-        time.sleep(0.03)
-        if timeout and (time.monotonic() - start) > timeout:
-            return None
-
-
-def keypad_close():
-    """Release keypad GPIO."""
-    global _kp_rows, _kp_cols
-    if _kp_rows:
-        for r in _kp_rows:
-            r.close()
-        for c in _kp_cols:
-            c.close()
-    _kp_rows = None
-    _kp_cols = None
-
-
-def keypad_input_string(prompt: str = "Enter ID:",
-                        max_len: int = 12) -> str:
-    """
-    Collect a string via keypad + LCD.
-    0-9, A-D = character.  * = backspace.  # = confirm.
-    """
-    buf = ""
-    lcd_show(prompt, buf + "_")
-    while True:
-        key = keypad_wait()
-        if key is None:
-            continue
-        if key == '#':
-            if buf:
-                return buf
-        elif key == '*':
-            buf = buf[:-1]
-        else:
-            if len(buf) < max_len:
-                buf += key
-        lcd_show(prompt, buf + ("_" if len(buf) < max_len else ""))
-
-
-def keypad_choice(line1: str, options: list[str]) -> int:
-    """
-    LCD menu — A=up, B/D=down, #=confirm.
-    Returns index of selected option.
-    """
-    idx = 0
-    lcd_show(line1, f"> {options[idx]}")
-    while True:
-        key = keypad_wait()
-        if key is None:
-            continue
-        if key == 'A' and idx > 0:
-            idx -= 1
-        elif key in ('B', 'D') and idx < len(options) - 1:
-            idx += 1
-        elif key == '#':
-            return idx
-        lcd_show(line1, f"> {options[idx]}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Module 5 — Audio engine
+# Module 3 — Audio engine
 # ══════════════════════════════════════════════════════════════════════════════
 
 def audio_init():
@@ -371,10 +306,10 @@ def play_word(words: dict, name: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 6 — Sound waveform builders
+# Module 4 — Audio waveform builders
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_regular_sound(blocktime_s: float, freq_hz: float) -> np.ndarray:
+def build_regular_audio(blocktime_s: float, freq_hz: float) -> np.ndarray:
     """Regular alternating A4/E5 at freq_hz for blocktime_s."""
     half   = 0.5 / freq_hz
     tone_d = TONE_DURATION
@@ -388,7 +323,7 @@ def build_regular_sound(blocktime_s: float, freq_hz: float) -> np.ndarray:
     return train[:int(round(blocktime_s * SR))]
 
 
-def build_arrhythmic_sound_from_template(template: list,
+def build_arrhythmic_audio_from_template(template: list,
                                           blocktime_s: float) -> np.ndarray:
     """
     Build arrhythmic waveform from a template.
@@ -417,7 +352,7 @@ def build_arrhythmic_sound_from_template(template: list,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 7 — Arrhythmic template loader
+# Module 5 — Arrhythmic template loader
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_arrhythmic_templates(path: str,
@@ -465,7 +400,7 @@ def template_to_haptic_events(template: list,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 8 — Haptic engine
+# Module 6 — Haptic engine
 # ══════════════════════════════════════════════════════════════════════════════
 
 _drv = None
@@ -512,7 +447,7 @@ def play_haptic_block(drv, events: list, total_s: float):
         time.sleep(remaining)
 
 
-def play_haptic_event(drv, effect_id: int): 
+def play_haptic_event(drv, effect_id: int):
     drv.sequence[0] = adafruit_drv2605.Effect(effect_id)
     drv.play()
     time.sleep(1)
@@ -536,7 +471,7 @@ def build_regular_haptic(blocktime_s: float, freq_hz: float,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 10 — CSV logger
+# Module 7 — CSV logger
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ExperimentLogger:
@@ -549,10 +484,24 @@ class ExperimentLogger:
       - sync_rating       : only for the final silent block of each trial
     """
 
+    # Unified schema: one file per Pi, rows distinguished by `event_type`.
+    # Time columns are the same names as in the rpi-fetch CSV so cross-Pi
+    # alignment uses one pair of names:
+    #   recv_time_iso : host wall clock (timezone-aware ISO8601 microseconds)
+    #   recv_perf_s   : this Pi's local time.perf_counter() in seconds
+    #
+    #   block rows: recv_time_iso/recv_perf_s = block start (captured AFTER
+    #               ping volley); marker_label + rtt*_ms empty.
+    #   ping  rows: recv_time_iso/recv_perf_s = first-ping time;
+    #               block-metadata columns empty except trial_num; rtt*_ms
+    #               hold the three RTTs (ms) or an error tag ('timeout',
+    #               'bad', 'mismatch', 'err:<n>').
     HEADER = [
+        'event_type',
         'participant_id',
         'trial_num',
-        'block_start_time_utc',
+        'recv_time_iso',
+        'recv_perf_s',
         'modality',
         'block_position',
         'block_subtype',
@@ -562,6 +511,10 @@ class ExperimentLogger:
         'freq_jitter_sign',
         'attend_high',
         'sync_rating',
+        'marker_label',
+        'rtt1_ms',
+        'rtt2_ms',
+        'rtt3_ms',
     ]
 
     def __init__(self, participant_id: str, output_dir: str = 'log'):
@@ -590,15 +543,20 @@ class ExperimentLogger:
                   freq_hz: float | str = '',
                   freq_jitter_sign: int | str = '',
                   sync_rating: int | str = '',
-                  block_start_time_utc: str | None = None):
-        if block_start_time_utc is None:
-            block_start_time_utc = datetime.now(timezone.utc).isoformat(
+                  recv_time_iso: str | None = None,
+                  recv_perf_s: float | None = None):
+        if recv_time_iso is None:
+            recv_time_iso = datetime.now(timezone.utc).isoformat(
                 timespec='microseconds'
             )
+        if recv_perf_s is None:
+            recv_perf_s = time.perf_counter()
         row = [
+            'block',
             self.pid,
             trial_num,
-            block_start_time_utc,
+            recv_time_iso,
+            f"{recv_perf_s:.6f}",
             modality,
             block_position,
             block_subtype,
@@ -608,12 +566,33 @@ class ExperimentLogger:
             freq_jitter_sign,
             attend_high,
             sync_rating,
+            '', '', '', '',   # marker_label, rtt1_ms, rtt2_ms, rtt3_ms
+        ]
+        self._append_row(row)
+
+    def log_ping(self, *, marker_label: str, trial_num: int | str,
+                 recv_time_iso: str, recv_perf_s: float, rtts: list[str]):
+        """Append one 'ping' row (three-round latency probe for `marker_label`).
+        Block-metadata columns are left blank; `rtts` is a 3-element list of
+        RTT strings already formatted in ms (or an error tag)."""
+        r1 = rtts[0] if len(rtts) > 0 else ''
+        r2 = rtts[1] if len(rtts) > 1 else ''
+        r3 = rtts[2] if len(rtts) > 2 else ''
+        row = [
+            'ping',
+            self.pid,
+            trial_num,
+            recv_time_iso,
+            f"{recv_perf_s:.6f}",
+            '', '', '', '', '', '', '', '', '',  # block-metadata columns
+            marker_label,
+            r1, r2, r3,
         ]
         self._append_row(row)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 11 — Stimulus precomputation + unified trial runner
+# Module 8 — Stimulus precomputation + unified trial runner
 # ══════════════════════════════════════════════════════════════════════════════
 
 def precompute_stimuli(templates: list, blocktime: float,
@@ -630,10 +609,10 @@ def precompute_stimuli(templates: list, blocktime: float,
 
     audio = {
         'silent':       _silence(blocktime),
-        'regular_low':  build_regular_sound(blocktime, freq_low),
-        'regular_high': build_regular_sound(blocktime, freq_high),
+        'regular_low':  build_regular_audio(blocktime, freq_low),
+        'regular_high': build_regular_audio(blocktime, freq_high),
         'arrhythmic': [
-            build_arrhythmic_sound_from_template(tpl, blocktime)
+            build_arrhythmic_audio_from_template(tpl, blocktime)
             for tpl in templates
         ],
     }
@@ -663,7 +642,8 @@ def run_trial(*,
               words: dict,
               logger: ExperimentLogger,
               effect1: int,
-              effect2: int):
+              effect2: int,
+              headless: bool = False):
     """Run one trial for either modality.
 
     Preamble : 'ready' → pause → 'ignore'
@@ -672,18 +652,20 @@ def run_trial(*,
                the order given by `block_order`:
                  'arr_first' → arrhythmic at 1, regular at 3
                  'reg_first' → regular    at 1, arrhythmic at 3
+    Per-block: ping_volley() → capture recv_time_iso + recv_perf_s →
+               send_marker_packet() → play stimulation. The pings warm the
+               network path so the marker UDP arrives with the lowest
+               possible latency.
     Attention: plays immediately before the regular block.
     Rating   : after the final silent block, 'ratesync' plays and a 1-5
-               keypad rating is collected and logged.
+               sync rating is collected at the terminal and logged.
     """
-    is_sound     = (modality == 'sound')
-    mod_marker   = 'a' if is_sound else 'v'
-    lcd_banner   = 'SOUND' if is_sound else 'VIBRATION'
-    lcd_short    = 'SOUND' if is_sound else 'VIBR'
-    freq_key     = 'regular_high' if freq_jitter_sign > 0 else 'regular_low'
+    is_audio   = (modality == 'audio')
+    mod_marker = 'a' if is_audio else 'v'
+    freq_key   = 'regular_high' if freq_jitter_sign > 0 else 'regular_low'
 
     # ── Pick stimuli ─────────────────────────────────────────────────────
-    if is_sound:
+    if is_audio:
         w_silent   = stim_audio['silent']
         w_arrhythm = stim_audio['arrhythmic'][template_index]
         w_regular  = stim_audio[freq_key]
@@ -703,13 +685,12 @@ def run_trial(*,
         subtype_by_position = {0: 'silent', 1: 'regular', 2: 'silent',
                                3: 'arrhythmic', 4: 'silent'}
 
-    if is_sound:
+    if is_audio:
         attend_word = 'attendhigh'  if attend_high else 'attendlow'
     else:
         attend_word = 'attendclick' if attend_high else 'attendbuzz'
 
     # ── Preamble ─────────────────────────────────────────────────────────
-    lcd_show(lcd_banner, "Get ready...")
     play_word(words, 'ready')
     time.sleep(0.5)
     play_word(words, 'pause')
@@ -718,7 +699,8 @@ def run_trial(*,
 
     # ── Run the 5 blocks ─────────────────────────────────────────────────
     n_pairs = len(template)
-    final_silent_start_utc = None
+    final_silent_recv_time_iso = None
+    final_silent_recv_perf_s   = None
 
     for position in range(5):
         subtype = subtype_by_position[position]
@@ -727,7 +709,7 @@ def run_trial(*,
         if subtype == 'regular':
             play_word(words, attend_word)
             time.sleep(0.5)
-            if is_sound:
+            if is_audio:
                 play_audio(_synth_tone(
                     F_HIGH if attend_high else F_LOW, 0.5
                 ))
@@ -735,9 +717,6 @@ def run_trial(*,
                 play_haptic_event(_drv, effect1 if attend_high else effect2)
             time.sleep(2)
 
-        block_start_utc = datetime.now(timezone.utc).isoformat(
-            timespec='microseconds'
-        )
         marker = f"{mod_marker}_{subtype[:3]}_p{position}_t{trial_num}"
 
         # Per-block metadata for the logger
@@ -757,8 +736,19 @@ def run_trial(*,
             freq_sign_log = freq_jitter_sign
             desc          = f"regular {freq_hz:.3f}Hz"
 
-        lcd_show(f"{lcd_short} {position}/4", subtype.capitalize())
         print(f"    Block {position}: {desc}")
+
+        # 1. Ping volley FIRST — warms the network path before block trigger.
+        ping_volley(marker, trial_num=trial_num)
+
+        # 2. Capture block-start timestamps and emit the marker packet on
+        #    the now-warm path. recv_time_iso/recv_perf_s reflect the actual
+        #    block trigger moment, not when the pre-block volley started.
+        block_recv_time_iso = datetime.now(timezone.utc).isoformat(
+            timespec='microseconds'
+        )
+        block_recv_perf_s = time.perf_counter()
+        send_marker_packet(marker)
 
         # The final silent block is logged AFTER its sync rating is collected
         # (so the rating lands on the same row). Every other block is logged now.
@@ -773,33 +763,39 @@ def run_trial(*,
                 template_index=tpl_log,
                 freq_hz=freq_log,
                 freq_jitter_sign=freq_sign_log,
-                block_start_time_utc=block_start_utc,
+                recv_time_iso=block_recv_time_iso,
+                recv_perf_s=block_recv_perf_s,
             )
         else:
-            final_silent_start_utc = block_start_utc
-        send_marker(marker)
+            final_silent_recv_time_iso = block_recv_time_iso
+            final_silent_recv_perf_s   = block_recv_perf_s
 
-        # Play the stimulus
+        # 3. Play the stimulus
         if subtype == 'silent':
-            if is_sound:
+            if is_audio:
                 play_audio(w_silent)
             else:
                 time.sleep(blocktime)
         elif subtype == 'arrhythmic':
-            if is_sound:
+            if is_audio:
                 play_audio(w_arrhythm)
             else:
                 play_haptic_block(_drv, h_arrhythm, blocktime)
         else:  # 'regular'
-            if is_sound:
+            if is_audio:
                 play_audio(w_regular)
             else:
                 play_haptic_block(_drv, h_regular, blocktime)
 
     # ── Sync rating for the final silent block ───────────────────────────
-    play_word(words, 'ratesync')
-    sync_rating = get_sync_rating()
-    send_marker(f"{mod_marker}_rate_t{trial_num}")
+    if headless:
+        sync_rating = ''
+    else:
+        play_word(words, 'ratesync')
+        sync_rating = get_sync_rating()
+        rate_marker = f"{mod_marker}_rate_t{trial_num}"
+        ping_volley(rate_marker, trial_num=trial_num)
+        send_marker_packet(rate_marker)
     logger.log_block(
         trial_num=trial_num,
         modality=modality,
@@ -808,101 +804,61 @@ def run_trial(*,
         block_order=block_order,
         attend_high=attend_high,
         sync_rating=sync_rating,
-        block_start_time_utc=final_silent_start_utc,
+        recv_time_iso=final_silent_recv_time_iso,
+        recv_perf_s=final_silent_recv_perf_s,
     )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 12 — User input helpers (keypad or terminal fallback)
+# Module 9 — Operator terminal input
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# All operator I/O is plain stdin via the controlling terminal (RF-dongle
+# USB keyboard). No on-Pi keypad or LCD/OLED.
 
 def get_participant_id() -> str:
-    if KEYPAD_AVAILABLE and _kp_rows is not None:
-        lcd_show("Participant ID:", "Key in + # OK")
-        return keypad_input_string("Participant ID:")
-    else:
-        return input("Enter participant ID: ").strip()
+    return input("Enter participant ID: ").strip()
 
 
 def wait_for_continue() -> bool:
-    """# = continue, * = quit."""
-    lcd_show("Press # to", "continue  *=quit")
-    if KEYPAD_AVAILABLE and _kp_rows is not None:
-        while True:
-            key = keypad_wait(timeout=300)
-            if key == '#':
-                return True
-            if key == '*':
-                return False
-    else:
-        while True:
-            try:
-                k = input("  >> y=continue, q=quit: ").strip().lower()
-            except EOFError:
-                return False
-            if k == 'y':
-                return True
-            if k == 'q':
-                return False
+    """y/Enter = continue, q = quit."""
+    while True:
+        try:
+            k = input("  >> y=continue, q=quit: ").strip().lower()
+        except EOFError:
+            return False
+        if k in ('', 'y'):
+            return True
+        if k == 'q':
+            return False
 
 
 def get_sync_rating() -> int:
     """Collect a 1-5 sync rating after ratesync."""
-    if KEYPAD_AVAILABLE and _kp_rows is not None:
-        lcd_show("Sync rating", "1-5")
-        while True:
-            key = keypad_wait()
-            if key in ('1', '2', '3', '4', '5'):
-                return int(key)
-    else:
-        while True:
-            try:
-                val = input("  >> Sync rating (1-5): ").strip()
-            except EOFError:
-                return 0
-            if val in {'1', '2', '3', '4', '5'}:
-                return int(val)
+    while True:
+        try:
+            val = input("  >> Sync rating (1-5): ").strip()
+        except EOFError:
+            return 0
+        if val in {'1', '2', '3', '4', '5'}:
+            return int(val)
 
 
 def get_resume_start_index(blocknum: int, total_trials: int,
                            has_two_blocks: bool) -> int:
     """Prompt resume position and return 0-based trial index to start from."""
-    if KEYPAD_AVAILABLE and _kp_rows is not None:
-        lcd_show("Resume session?", "1=yes 0=no")
-        while True:
-            key = keypad_wait()
-            if key == '0':
-                return 0
-            if key == '1':
-                break
+    ans = input("Resume previous session? (1/0): ").strip()
+    if ans != '1':
+        return 0
 
-        block = 'a'
-        if has_two_blocks:
-            lcd_show("Which block", "A or B")
-            while True:
-                key = keypad_wait()
-                if key in ('A', 'B'):
-                    block = key.lower()
-                    break
+    block = 'a'
+    if has_two_blocks:
+        block = input("Which block (a/b): ").strip().lower()
 
-        trial_str = keypad_input_string("Trial number:", max_len=4)
-        try:
-            trial_num = int(trial_str)
-        except ValueError:
-            return 0
-    else:
-        ans = input("Resume previous session? (1/0): ").strip()
-        if ans != '1':
-            return 0
-
-        block = 'a'
-        if has_two_blocks:
-            block = input("Which block (a/b): ").strip().lower()
-
-        try:
-            trial_num = int(input("Which trial number: ").strip())
-        except ValueError:
-            return 0
+    try:
+        trial_num = int(input("Which trial number: ").strip())
+    except ValueError:
+        return 0
 
     if trial_num < 1 or trial_num > blocknum:
         return 0
@@ -966,12 +922,12 @@ def build_trial_plan(blocknum: int,
         return signs, orders, attend
 
     if randomize:
-        modalities = [rng.choice(['sound', 'vibration']) for _ in range(blocknum)]
+        modalities = [rng.choice(['audio', 'vibration']) for _ in range(blocknum)]
         signs, orders, attend = counterbalance_chunk(blocknum)
         mode_desc = f"randomized-seeded ({blocknum} trials)"
     else:
         first = firstblock
-        other = 'vibration' if first == 'sound' else 'sound'
+        other = 'vibration' if first == 'audio' else 'audio'
         modalities = [first] * blocknum + [other] * blocknum
         s1, o1, a1 = counterbalance_chunk(blocknum)
         s2, o2, a2 = counterbalance_chunk(blocknum)
@@ -984,7 +940,7 @@ def build_trial_plan(blocknum: int,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 13 — Main experiment
+# Module 10 — Main experiment
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
@@ -992,25 +948,18 @@ def main():
 
     # ── Init hardware ────────────────────────────────────────────────────
     audio_init()
-    lcd_init()
-    keypad_init()
     haptic_init()
 
     if args.list_devices:
         print(sd.query_devices())
-        keypad_close()
         return
 
-    marker_init(logger_ip)   # logger Pi's IP
-
     # ── Participant ID ───────────────────────────────────────────────────
-    lcd_show("== CUE EXPT ==", "Starting...")
-    time.sleep(1)
-
-    participant_id = get_participant_id()
-    lcd_show(f"ID: {participant_id}", "Confirmed")
+    if args.headless:
+        participant_id = f"headless_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    else:
+        participant_id = get_participant_id()
     print(f"\nParticipant: {participant_id}")
-    time.sleep(1)
 
     # ── Parameters ───────────────────────────────────────────────────────
     blocknum          = args.blocknum
@@ -1031,12 +980,10 @@ def main():
         print("ERROR: templates.csv not found.")
         print("Run: python3 generate_templates.py --blocktime "
               f"{blocktime} --num-templates {NUM_TEMPLATES}")
-        keypad_close()
         return
     except Exception as e:
         print(f"ERROR: failed to load templates.csv — {e}")
         print("Regenerate with: python3 generate_templates.py")
-        keypad_close()
         return
     for i, tpl in enumerate(templates):
         if tpl:
@@ -1063,12 +1010,16 @@ def main():
 
     total_trials   = len(modalities)
     has_two_blocks = not args.randomize
-    start_idx      = get_resume_start_index(blocknum, total_trials, has_two_blocks)
-    if start_idx > 0:
-        print(f"Resuming from trial {start_idx + 1}/{total_trials}")
+    if args.headless:
+        start_idx = 0
+    else:
+        start_idx = get_resume_start_index(blocknum, total_trials, has_two_blocks)
+        if start_idx > 0:
+            print(f"Resuming from trial {start_idx + 1}/{total_trials}")
 
     # ── Logger ───────────────────────────────────────────────────────────
     logger = ExperimentLogger(participant_id)
+    marker_init(logger_ip, logger=logger)
 
     # ── Pre-load WAV cues ────────────────────────────────────────────────
     words = {}
@@ -1105,7 +1056,6 @@ def main():
     print(f"  Log file          : {logger.filename}")
     print(f"{'='*60}")
 
-    lcd_show(f"{total_trials} trials", f"~{est_minutes:.0f} min total")
     time.sleep(2)
 
     # ── Trial loop ───────────────────────────────────────────────────────
@@ -1129,11 +1079,8 @@ def main():
                   f"attend={'high' if attend_high else 'low'}")
             print(f"{'─'*50}")
 
-            lcd_show(f"Trial {trial_num}/{total_trials}",
-                     f"{modality[:4]} T#{tpl_idx}")
-
             t0 = time.perf_counter()
-            if modality in ('sound', 'vibration'):
+            if modality in ('audio', 'vibration'):
                 run_trial(
                     modality=modality,
                     trial_num=trial_num,
@@ -1150,15 +1097,15 @@ def main():
                     logger=logger,
                     effect1=effect1,
                     effect2=effect2,
+                    headless=args.headless,
                 )
             else:
                 print(f"  [ERROR] Unknown modality '{modality}' — skipping trial")
             elapsed = time.perf_counter() - t0
 
             print(f"  Trial {trial_num} done ({elapsed:.1f}s)")
-            lcd_show("Rest", "# next  * quit")
 
-            if idx < total_trials - 1:
+            if idx < total_trials - 1 and not args.headless:
                 if not wait_for_continue():
                     break
     except KeyboardInterrupt:
@@ -1166,20 +1113,16 @@ def main():
         print("\nInterrupted by user (Ctrl+C). Logged rows were flushed to disk.")
 
     # ── Done ─────────────────────────────────────────────────────────────
-    lcd_show("Experiment", "Interrupted" if interrupted else "Complete!")
     print(f"\n{'='*60}")
     if interrupted:
         print(f"Experiment interrupted — {logger.filename}")
     else:
         print(f"Experiment complete — {logger.filename}")
     print(f"{'='*60}")
-    time.sleep(3)
-    lcd_show("", "")
-    keypad_close()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 14 — CLI
+# Module 11 — CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_args():
@@ -1204,8 +1147,8 @@ def parse_args():
                    help="Counter-balance within-trial block order "
                         "(arr_first / reg_first). Off by default — every "
                         "trial runs silent→arr→silent→reg→silent.")
-    p.add_argument('--firstblock',  type=str,   default='sound',
-                   choices=['sound', 'vibration'],
+    p.add_argument('--firstblock',  type=str,   default='audio',
+                   choices=['audio', 'vibration'],
                    help="Modality of the first block when not --randomize")
     p.add_argument('--effect1',     type=int,   default=DEFAULT_EFFECT1,
                    help="DRV2605 effect id for the 'low/click' haptic tone")
@@ -1213,6 +1156,12 @@ def parse_args():
                    help="DRV2605 effect id for the 'high/buzz' haptic tone")
     p.add_argument('--list-devices', action='store_true',
                    help="Print sounddevice devices and exit")
+    p.add_argument('--headless',    action='store_true',
+                   help="Run with no operator input: auto-generate "
+                        "participant ID, start at trial 1 (no resume prompt), "
+                        "skip the ratesync + sync rating block and the "
+                        "between-trial continue prompt. For unattended "
+                        "hardware-load / heating tests.")
     return p.parse_args()
 
 
