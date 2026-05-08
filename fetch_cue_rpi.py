@@ -12,9 +12,12 @@ CSV schema:
   channel,edge,stamp_ticks,recv_time_iso,recv_perf_s,label
 
 `recv_time_iso` is the host wall clock (timezone-aware ISO8601) and
-`recv_perf_s` is this Pi's local `time.perf_counter()` in seconds, captured
-next to it. The same column names are used in cue_experiment.py's cue_log
-so downstream alignment code sees a single naming convention across both Pis.
+`recv_perf_s` is this Pi's local `clock_gettime(CLOCK_MONOTONIC_RAW)` in
+seconds, captured next to it. RAW is used (not perf_counter / CLOCK_MONOTONIC)
+so the value reflects the SoC oscillator without NTP rate-slewing — needed
+for cross-Pi clock-skew measurement. The same column names are used in
+cue_experiment.py's cue_log so downstream alignment code sees a single
+naming convention across both Pis.
 """
 
 import argparse
@@ -55,6 +58,18 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 
 # ------------------------ Helpers ------------------------
+
+def perf_counter_raw() -> float:
+    """Monotonic seconds from the SoC oscillator, NOT NTP-slewed.
+
+    time.perf_counter() on Linux is clock_gettime(CLOCK_MONOTONIC), which is
+    rate-disciplined by NTP — its tick rate tracks the upstream consensus
+    rather than the local hardware. CLOCK_MONOTONIC_RAW reads the same
+    underlying timekeeper but bypasses NTP slewing, so cross-device elapsed
+    time reflects the actual hardware oscillator skew between Pis.
+    """
+    return time.clock_gettime(time.CLOCK_MONOTONIC_RAW)
+
 
 def auto_detect_port():
     """
@@ -163,7 +178,7 @@ class UDPMarkerThread(threading.Thread):
                 continue
 
             recv_time_iso = datetime.now().astimezone().isoformat(timespec="microseconds")
-            recv_perf_s   = time.perf_counter()
+            recv_perf_s   = perf_counter_raw()
             try:
                 self.queue.put_nowait(("M", "", 0, recv_time_iso, recv_perf_s, label))
             except Exception:
@@ -405,7 +420,7 @@ def main():
                         continue
 
                     recv_time_iso = datetime.now().astimezone().isoformat(timespec="microseconds")
-                    recv_perf_s   = time.perf_counter()
+                    recv_perf_s   = perf_counter_raw()
 
                     try:
                         queue.put_nowait((channel, edge, stamp, recv_time_iso, recv_perf_s, ""))

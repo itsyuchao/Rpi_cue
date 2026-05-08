@@ -88,6 +88,18 @@ _ping_nonce: int = 0
 _logger = None  # ExperimentLogger, set by marker_init
 
 
+def perf_counter_raw() -> float:
+    """Monotonic seconds from the SoC oscillator, NOT NTP-slewed.
+
+    time.perf_counter() on Linux is clock_gettime(CLOCK_MONOTONIC), which is
+    rate-disciplined by NTP — its tick rate tracks the upstream consensus
+    rather than the local hardware. CLOCK_MONOTONIC_RAW reads the same
+    underlying timekeeper but bypasses NTP slewing, so cross-device elapsed
+    time reflects the actual hardware oscillator skew between Pis.
+    """
+    return time.clock_gettime(time.CLOCK_MONOTONIC_RAW)
+
+
 def marker_init(host: str, port: int = 5005,
                 ping_port: int = _UDP_PING_PORT,
                 logger=None):
@@ -126,11 +138,11 @@ def _one_ping(label: str) -> str:
     payload  = f"PING:{nonce}:{label}".encode("ascii")
 
     _drain_ping_sock()
-    t0 = time.perf_counter()
+    t0 = perf_counter_raw()
     try:
         _ping_sock.sendto(payload, _ping_addr)
         data, _ = _ping_sock.recvfrom(128)
-        t1 = time.perf_counter()
+        t1 = perf_counter_raw()
     except _socket.timeout:
         return "timeout"
     except OSError as e:
@@ -159,7 +171,7 @@ def ping_volley(label: str, trial_num: int | str = ''):
     if _ping_sock is None or _ping_addr is None:
         return
     ping_iso  = datetime.now(timezone.utc).isoformat(timespec='microseconds')
-    ping_perf = time.perf_counter()
+    ping_perf = perf_counter_raw()
     rtts = [_one_ping(label) for _ in range(3)]
     if _logger is not None:
         _logger.log_ping(
@@ -425,13 +437,13 @@ def play_haptic(drv, events: list):
     """Fire haptic schedule with spin-wait precision."""
     if not events or drv is None:
         return
-    t0 = time.perf_counter()
+    t0 = perf_counter_raw()
     for rel_t, effect_id in events:
-        now  = time.perf_counter() - t0
+        now  = perf_counter_raw() - t0
         wait = rel_t - now
         if wait > 0.002:
             time.sleep(wait - 0.001)
-        while time.perf_counter() - t0 < rel_t:
+        while perf_counter_raw() - t0 < rel_t:
             pass
         drv.sequence[0] = adafruit_drv2605.Effect(effect_id)
         drv.play()
@@ -440,9 +452,9 @@ def play_haptic(drv, events: list):
 
 def play_haptic_block(drv, events: list, total_s: float):
     """Play haptic schedule then wait until total_s elapsed."""
-    t0 = time.perf_counter()
+    t0 = perf_counter_raw()
     play_haptic(drv, events)
-    remaining = total_s - (time.perf_counter() - t0)
+    remaining = total_s - (perf_counter_raw() - t0)
     if remaining > 0:
         time.sleep(remaining)
 
@@ -488,7 +500,9 @@ class ExperimentLogger:
     # Time columns are the same names as in the rpi-fetch CSV so cross-Pi
     # alignment uses one pair of names:
     #   recv_time_iso : host wall clock (timezone-aware ISO8601 microseconds)
-    #   recv_perf_s   : this Pi's local time.perf_counter() in seconds
+    #   recv_perf_s   : this Pi's clock_gettime(CLOCK_MONOTONIC_RAW) in
+    #                   seconds (NOT perf_counter / CLOCK_MONOTONIC, which
+    #                   is NTP-slewed; see perf_counter_raw above)
     #
     #   block rows: recv_time_iso/recv_perf_s = block start (captured AFTER
     #               ping volley); marker_label + rtt*_ms empty.
@@ -550,7 +564,7 @@ class ExperimentLogger:
                 timespec='microseconds'
             )
         if recv_perf_s is None:
-            recv_perf_s = time.perf_counter()
+            recv_perf_s = perf_counter_raw()
         row = [
             'block',
             self.pid,
@@ -747,7 +761,7 @@ def run_trial(*,
         block_recv_time_iso = datetime.now(timezone.utc).isoformat(
             timespec='microseconds'
         )
-        block_recv_perf_s = time.perf_counter()
+        block_recv_perf_s = perf_counter_raw()
         send_marker_packet(marker)
 
         # The final silent block is logged AFTER its sync rating is collected
@@ -994,11 +1008,11 @@ def main():
 
     # ── Precompute every stimulus up front (low-latency trials) ──────────
     print("\nPrecomputing audio & haptic stimuli...", flush=True)
-    t_pre = time.perf_counter()
+    t_pre = perf_counter_raw()
     stim_audio, stim_haptic, freq_low, freq_high = precompute_stimuli(
         templates, blocktime, freq, freq_jitter_ratio, effect1, effect2,
     )
-    print(f"  Done in {time.perf_counter() - t_pre:.2f}s "
+    print(f"  Done in {perf_counter_raw() - t_pre:.2f}s "
           f"(regular rates: {freq_low:.3f} / {freq_high:.3f} Hz)")
 
     # ── Build per-trial schedules ────────────────────────────────────────
@@ -1079,7 +1093,7 @@ def main():
                   f"attend={'high' if attend_high else 'low'}")
             print(f"{'─'*50}")
 
-            t0 = time.perf_counter()
+            t0 = perf_counter_raw()
             if modality in ('audio', 'vibration'):
                 run_trial(
                     modality=modality,
@@ -1101,7 +1115,7 @@ def main():
                 )
             else:
                 print(f"  [ERROR] Unknown modality '{modality}' — skipping trial")
-            elapsed = time.perf_counter() - t0
+            elapsed = perf_counter_raw() - t0
 
             print(f"  Trial {trial_num} done ({elapsed:.1f}s)")
 
