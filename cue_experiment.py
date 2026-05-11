@@ -1054,7 +1054,7 @@ def main():
 
     print(f"\n{'='*20}")
     print(f"  Participant   : {participant_id}")
-    print(f"  Modalities    : {mode_desc}")
+    print(f"  Trials    : {total_trials}")
     print(f"  Regular freq  : {freq} Hz ± {freq_jitter_ratio*100:.1f}% ")
     print(f"  Est. duration : ~{est_minutes:.1f} min")
     print(f"{'='*20}")
@@ -1083,9 +1083,9 @@ def main():
             freq_delivered = freq_high if freq_sign > 0 else freq_low
 
             print(f"\n{'─'*20}")
-            print(f"  Trial {trial_num}/{total_trials}  "
+            print(f"T#{trial_num}/{total_trials}  "
                   f"[{modality.upper()}] "
-                  f"freq={freq_delivered:.3f}Hz ({'+' if freq_sign > 0 else '-'})  "
+                  f"f={freq_delivered:.3f}Hz ({'+' if freq_sign > 0 else '-'})  "
                   f"attend={'high' if attend_high else 'low'}")
             print(f"{'─'*20}")
 
