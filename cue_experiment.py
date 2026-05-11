@@ -88,6 +88,10 @@ _ping_nonce: int = 0
 _logger = None  # ExperimentLogger, set by marker_init
 
 
+# trial_dict = {0: "left_high", 1: "left_low", 2: "right_high", 3: "right_low"}
+# trial_order = [0, 1, 2, 3, 1, 3, 0, 2, 2, 0, 3, 1]
+
+
 def perf_counter_raw() -> float:
     """Monotonic seconds from the SoC oscillator, NOT NTP-slewed.
 
@@ -191,7 +195,7 @@ def send_marker_packet(label: str):
         pass
 
 
-logger_ip = "192.168.50.5"
+logger_ip = "192.168.50.13"
 # ══════════════════════════════════════════════════════════════════════════════
 # Module 1 — Hardware imports (graceful fallback)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -220,12 +224,6 @@ ATTACK_MS  = 5
 RELEASE_MS = 20
 HARMONICS  = [(1, 1.00), (2, 0.30), (3, 0.15), (4, 0.10)]
 TONE_DURATION = 0.15
-
-# Arrhythmic timing — both inter-pair AND intra-pair randomised
-ARHYTHM_INTER_MIN = 0.1
-ARHYTHM_INTER_MAX = 0.9
-ARHYTHM_INTRA_MIN = 0.1
-ARHYTHM_INTRA_MAX = 0.9
 
 # Regular-cue frequency jitter — the delivered rate is
 #   freq * (1 ± FREQ_JITTER_RATIO_DEFAULT)
@@ -705,11 +703,9 @@ def run_trial(*,
         attend_word = 'attendclick' if attend_high else 'attendbuzz'
 
     # ── Preamble ─────────────────────────────────────────────────────────
-    play_word(words, 'ready')
-    time.sleep(0.5)
-    play_word(words, 'pause')
-    time.sleep(max(0.5, 2.0 + random.uniform(-0.5, 0.5)))
     play_word(words, 'ignore')
+    time.sleep(max(0.5, 2.0 + random.uniform(-0.5, 0.5)))
+    play_word(words, 'go')
 
     # ── Run the 5 blocks ─────────────────────────────────────────────────
     n_pairs = len(template)
@@ -719,8 +715,8 @@ def run_trial(*,
     for position in range(5):
         subtype = subtype_by_position[position]
 
-        # Attention cue immediately before the regular block (either position)
-        if subtype == 'regular':
+        # Attention cue immediately before the silent preceding regular block
+        if position == 2:
             play_word(words, attend_word)
             time.sleep(0.5)
             if is_audio:
@@ -729,7 +725,7 @@ def run_trial(*,
                 ))
             else:
                 play_haptic_event(_drv, effect1 if attend_high else effect2)
-            time.sleep(2)
+            time.sleep(1)
 
         marker = f"{mod_marker}_{subtype[:3]}_p{position}_t{trial_num}"
 
@@ -970,7 +966,7 @@ def main():
 
     # ── Participant ID ───────────────────────────────────────────────────
     if args.headless:
-        participant_id = f"headless_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        participant_id = f"headless"
     else:
         participant_id = get_participant_id()
     print(f"\nParticipant: {participant_id}")
@@ -1037,7 +1033,7 @@ def main():
 
     # ── Pre-load WAV cues ────────────────────────────────────────────────
     words = {}
-    for name in ['ready', 'pause', 'ignore',
+    for name in ['ignore', 'go',
                  'attendhigh', 'attendlow',
                  'attendclick', 'attendbuzz',
                  'ratesync']:
@@ -1144,9 +1140,9 @@ def parse_args():
         description="Rhythmic cueing experiment",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument('--blocknum',    type=int,   default=20,
+    p.add_argument('--blocknum',    type=int,   default=12,
                    help="Trials per modality (or total trials if --randomize)")
-    p.add_argument('--blocktime',   type=float, default=15,
+    p.add_argument('--blocktime',   type=float, default=20,
                    help="Duration of each sub-block (s)")
     p.add_argument('--freq',        type=float, default=1.0,
                    help="Nominal regular-cue rate (Hz). Delivered rate is "
