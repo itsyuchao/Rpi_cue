@@ -945,10 +945,8 @@ def build_trial_plan(blocknum: int,
     signs      = [c[1] for c in conditions]
     attend     = [c[2] for c in conditions]
     orders     = ['arr_first'] * total
-    mode_desc  = (f"randomized-balanced ({total} trials, "
-                  f"seed=pid:{participant_id}/leg:{leg})")
 
-    return modalities, attend, signs, orders, mode_desc
+    return modalities, attend, signs, orders
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -987,7 +985,7 @@ def main():
 
     # ── Load templates from fixed CSV ────────────────────────────────────
     print(f"\nLoading {NUM_TEMPLATES} arrhythmic templates from "
-          f"{TEMPLATE_CSV_PATH} ({blocktime}s each)...")
+          f"{TEMPLATE_CSV_PATH}...")
     try:
         templates = load_arrhythmic_templates(
             TEMPLATE_CSV_PATH, NUM_TEMPLATES,
@@ -1001,12 +999,12 @@ def main():
         print(f"ERROR: failed to load templates.csv — {e}")
         print("Regenerate with: python3 generate_templates.py")
         return
-    for i, tpl in enumerate(templates):
-        if tpl:
-            print(f"  Template {i:2d}: {len(tpl):2d} pairs, "
-                  f"span {tpl[-1][0]:.2f}s")
-        else:
-            print(f"  Template {i:2d}: empty")
+
+    if any(len(tpl) == 0 for tpl in templates):
+        print("ERROR: some templates are empty — check templates.csv")
+        return
+    else:
+        print("  Loaded templates.")
 
     # ── Precompute every stimulus up front (low-latency trials) ──────────
     print("\nPrecomputing audio & haptic stimuli...", flush=True)
@@ -1018,7 +1016,7 @@ def main():
           f"(regular rates: {freq_low:.3f} / {freq_high:.3f} Hz)")
 
     # ── Build per-trial schedules ────────────────────────────────────────
-    modalities, attention_schedule, freq_signs, block_orders, mode_desc = (
+    modalities, attention_schedule, freq_signs, block_orders = (
         build_trial_plan(blocknum, participant_id, leg)
     )
 
@@ -1036,17 +1034,21 @@ def main():
 
     # ── Pre-load WAV cues ────────────────────────────────────────────────
     words = {}
+    loaded_names = []
     for name in ['ignore', 'go',
                  f'attend{leg}high',  f'attend{leg}low',
                  f'attend{leg}click', f'attend{leg}buzz',
                  'ratesync', 'readyccw', 'readycw']:
         try:
             words[name] = load_wav(f'{name}.wav')
-            print(f"  Loaded {name}.wav ({len(words[name])/SR:.2f}s)")
+            loaded_names.append(name)
         except FileNotFoundError:
             print(f"WARNING: {name}.wav not found")
         except Exception as e:
             print(f"WARNING: {name}.wav — {e}")
+
+    if loaded_names:
+        print("  Loaded .wav files: " + ", ".join(loaded_names))
 
     # ── Summary ──────────────────────────────────────────────────────────
     trial_dur   = blocktime * 5
@@ -1086,7 +1088,7 @@ def main():
             print(f"T#{trial_num}/{total_trials}  "
                   f"[{modality.upper()}] "
                   f"f={freq_delivered:.3f}Hz ({'+' if freq_sign > 0 else '-'})  "
-                  f"attend={'high' if attend_high else 'low'}")
+                  f"attn={'high' if attend_high else 'low'}")
             print(f"{'─'*20}")
 
             t0 = perf_counter_raw()
