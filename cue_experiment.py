@@ -374,10 +374,8 @@ def build_arrhythmic_audio_from_template(template: list,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_arrhythmic_templates(path: str,
-                              expected_n: int,
-                              blocktime_s: float) -> list[list]:
+                              expected_n: int) -> list[list]:
     """Load templates from CSV file with tolerant parsing."""
-    del blocktime_s  # kept for call compatibility
     templates = [[] for _ in range(expected_n)]
     rows_by_template = {i: [] for i in range(expected_n)}
 
@@ -992,7 +990,7 @@ def main():
           f"{TEMPLATE_CSV_PATH} ({blocktime}s each)...")
     try:
         templates = load_arrhythmic_templates(
-            TEMPLATE_CSV_PATH, NUM_TEMPLATES, blocktime,
+            TEMPLATE_CSV_PATH, NUM_TEMPLATES,
         )
     except FileNotFoundError:
         print("ERROR: templates.csv not found.")
@@ -1044,7 +1042,7 @@ def main():
                  'ratesync', 'readyccw', 'readycw']:
         try:
             words[name] = load_wav(f'{name}.wav')
-            print(f"Loaded {name}.wav ({len(words[name])/SR:.2f}s)")
+            print(f"  Loaded {name}.wav ({len(words[name])/SR:.2f}s)")
         except FileNotFoundError:
             print(f"WARNING: {name}.wav not found")
         except Exception as e:
@@ -1057,14 +1055,8 @@ def main():
     print(f"\n{'='*20}")
     print(f"  Participant       : {participant_id}")
     print(f"  Modalities        : {mode_desc}")
-    print(f"  Trials            : {total_trials}")
-    print(f"  Block time        : {blocktime}s x 5 = {trial_dur}s / trial")
-
-    print(f"  Block order       : fixed arr_first "
-              f"(silent→arr→silent→reg→silent)")
     print(f"  Regular freq      : {freq} Hz ± {freq_jitter_ratio*100:.1f}% "
           f"→ {freq_low:.3f} / {freq_high:.3f} Hz")
-    print(f"  Templates         : {NUM_TEMPLATES}")
     print(f"  Est. duration     : ~{est_minutes:.1f} min (excl. rests)")
     print(f"  Log file          : {logger.filename}")
     print(f"{'='*20}")
@@ -1092,13 +1084,12 @@ def main():
             attend_high    = attention_schedule[idx]
             freq_delivered = freq_high if freq_sign > 0 else freq_low
 
-            print(f"\n{'─'*25}")
+            print(f"\n{'─'*20}")
             print(f"  Trial {trial_num}/{total_trials}  "
-                  f"[{modality.upper()}]  T#{tpl_idx}")
-            print(f"    order={block_order}  "
+                  f"[{modality.upper()}] "
                   f"freq={freq_delivered:.3f}Hz ({'+' if freq_sign > 0 else '-'})  "
                   f"attend={'high' if attend_high else 'low'}")
-            print(f"{'─'*25}")
+            print(f"{'─'*20}")
 
             t0 = perf_counter_raw()
             if modality in ('audio', 'vibration'):
@@ -1135,12 +1126,12 @@ def main():
         print("\nInterrupted by user (Ctrl+C). Logged rows were flushed to disk.")
 
     # ── Done ─────────────────────────────────────────────────────────────
-    print(f"\n{'='*60}")
+    print(f"\n{'='*20}")
     if interrupted:
         print(f"Experiment interrupted — {logger.filename}")
     else:
         print(f"Experiment complete — {logger.filename}")
-    print(f"{'='*60}")
+    print(f"{'='*20}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
