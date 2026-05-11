@@ -716,7 +716,7 @@ def run_trial(*,
         subtype = subtype_by_position[position]
 
         # Attention cue immediately before the silent preceding regular block
-        if position == 2:
+        if subtype == 'regular':
             play_word(words, attend_word)
             time.sleep(0.5)
             if is_audio:
@@ -725,7 +725,7 @@ def run_trial(*,
                 ))
             else:
                 play_haptic_event(_drv, effect1 if attend_high else effect2)
-            time.sleep(1)
+            time.sleep(2)
 
         marker = f"{mod_marker}_{subtype[:3]}_p{position}_t{trial_num}"
 
