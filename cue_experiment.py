@@ -1053,12 +1053,10 @@ def main():
     est_minutes = total_trials * trial_dur / 60
 
     print(f"\n{'='*20}")
-    print(f"  Participant       : {participant_id}")
-    print(f"  Modalities        : {mode_desc}")
-    print(f"  Regular freq      : {freq} Hz ± {freq_jitter_ratio*100:.1f}% "
-          f"→ {freq_low:.3f} / {freq_high:.3f} Hz")
-    print(f"  Est. duration     : ~{est_minutes:.1f} min (excl. rests)")
-    print(f"  Log file          : {logger.filename}")
+    print(f"  Participant   : {participant_id}")
+    print(f"  Modalities    : {mode_desc}")
+    print(f"  Regular freq  : {freq} Hz ± {freq_jitter_ratio*100:.1f}% ")
+    print(f"  Est. duration : ~{est_minutes:.1f} min")
     print(f"{'='*20}")
 
     # ── Pre-experiment ready cue ─────────────────────────────────────────
