@@ -11,28 +11,36 @@ Hardware
 
 Operator console
 ----------------
-  All operator I/O (subject ID, resume prompt, between-trial continue,
-  sync rating) goes through the controlling terminal. An RF-dongle USB
-  keyboard plugs into this Pi for that purpose; there is no on-Pi
-  LCD/OLED or membrane keypad.
+  All operator I/O (subject ID, focus leg, resume prompt, ready-cue
+  confirmation, between-trial continue, sync rating) goes through the
+  controlling terminal. An RF-dongle USB keyboard plugs into this Pi for
+  that purpose; there is no on-Pi LCD/OLED or membrane keypad.
+
+Pre-experiment
+--------------
+  After subject ID + focus leg ('left'/'right') are entered, one
+  'ready{cw,ccw}.wav' cue plays and the operator confirms with 'y' before
+  trial 1. Rotation direction is counter-balanced against PID parity:
+      odd  PID + left → readyccw    odd  PID + right → readycw
+      even PID + left → readycw     even PID + right → readyccw
+  The focused leg is appended to the CSV log filename
+  (cue_log_pid-{pid}_focusleg-{leg}_{ts}.csv).
 
 Trial structure (5 sub-blocks × blocktime s each)
 -------------------------------------------------
-  'ready.wav' → pause → 'ignore.wav' → 5 blocks → 'ratesync.wav'
+  'ignore.wav' → pause → 'go.wav' → 5 blocks → 'ratesync.wav'
 
-  Cue-block order may be counter-balanced across trials if --randomize-arr-reg is specified:
+    block_order='arr_first'  : silent → arrhythmic → silent → regular → silent
 
-    block_order='arr_first'  : silent → arrhythmic → silent → regular    → silent
-    block_order='reg_first'  : silent → regular    → silent → arrhythmic → silent
+  The delivered regular-cue rate is counter-balanced per modality between
+  freq*(1-freq_jitter_ratio) and freq*(1+freq_jitter_ratio). With the
+  defaults (--blocknum 20, --freq 0.83, --freq-jitter-ratio 0.1) that is
+  10 trials at 0.73 Hz and 10 trials at 0.93 Hz per modality, with a balanced
+  attend-high / attend-low split. 
 
-  The delivered regular-cue rate is counter-balanced between
-  freq*(1+freq_jitter_ratio) and freq*(1-freq_jitter_ratio). With the
-  defaults (--blocknum 20, --freq 1.0, --freq-jitter-ratio 0.1) that is
-  10 trials at 1.1 Hz and 10 trials at 0.9 Hz per modality, fully crossed
-  with the two block orders (5 trials per cell).
-
-  The attention cue ('attendhigh'/'attendlow' or 'attendclick'/'attendbuzz')
-  always plays immediately before the regular block.
+  The attention cue ('attend{leg}high'/'attend{leg}low' or
+  'attend{leg}click'/'attend{leg}buzz') always plays immediately before
+  the regular block, where {leg} is the per-session focused leg.
 
   After the final silent block, 'ratesync.wav' plays and the operator
   enters a 1-5 sync rating at the terminal.
@@ -88,8 +96,8 @@ _ping_nonce: int = 0
 _logger = None  # ExperimentLogger, set by marker_init
 
 
-# trial_dict = {0: "left_high", 1: "left_low", 2: "right_high", 3: "right_low"}
-# trial_order = [0, 1, 2, 3, 1, 3, 0, 2, 2, 0, 3, 1]
+# trial_dict = {0: "high", 1: "low", 2: "click", 3: "buzz"}
+# trial_order = [0, 1, 2, 3, 1, 3, 0, 2, 2, 0, 3, 1, 2, 3, 0, 1, 3, 2, 1, 0]
 
 
 def perf_counter_raw() -> float:
@@ -529,12 +537,14 @@ class ExperimentLogger:
         'rtt3_ms',
     ]
 
-    def __init__(self, participant_id: str, output_dir: str = 'log'):
+    def __init__(self, participant_id: str, output_dir: str = 'log',
+                 focus_leg: str | None = None):
         self.pid = participant_id
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         os.makedirs(output_dir, exist_ok=True)
+        suffix = f"focusleg-{focus_leg}_" if focus_leg else ''
         self.filename = os.path.join(
-            output_dir, f"cue_log_{participant_id}_{ts}.csv"
+            output_dir, f"cue_log_pid-{participant_id}_{suffix}{ts}.csv"
         )
         with open(self.filename, 'w', newline='') as f:
             csv.writer(f).writerow(self.HEADER)
@@ -649,6 +659,7 @@ def run_trial(*,
               template_index: int,
               block_order: str,
               attend_high: bool,
+              leg: str,
               stim_audio: dict,
               stim_haptic: dict,
               words: dict,
@@ -698,9 +709,9 @@ def run_trial(*,
                                3: 'arrhythmic', 4: 'silent'}
 
     if is_audio:
-        attend_word = 'attendhigh'  if attend_high else 'attendlow'
+        attend_word = f'attend{leg}high'  if attend_high else f'attend{leg}low'
     else:
-        attend_word = 'attendclick' if attend_high else 'attendbuzz'
+        attend_word = f'attend{leg}click' if attend_high else f'attend{leg}buzz'
 
     # ── Preamble ─────────────────────────────────────────────────────────
     play_word(words, 'ignore')
@@ -830,6 +841,32 @@ def get_participant_id() -> str:
     return input("Enter participant ID: ").strip()
 
 
+def get_focus_leg() -> str:
+    """Prompt for the per-session focused leg ('left' or 'right')."""
+    while True:
+        try:
+            v = input("Focus leg (left/right): ").strip().lower()
+        except EOFError:
+            return 'left'
+        if v in ('left', 'l'):
+            return 'left'
+        if v in ('right', 'r'):
+            return 'right'
+
+
+def _ready_direction(pid: str, leg: str) -> str:
+    """Return 'cw' or 'ccw' for the pre-trial ready cue.
+
+    Counterbalances rotation direction across subjects:
+      odd  PID + left  → ccw    odd  PID + right → cw
+      even PID + left  → cw     even PID + right → ccw
+    Non-numeric `pid` (e.g. 'headless') is treated as even.
+    """
+    digits = ''.join(c for c in pid if c.isdigit())
+    pid_odd = bool(int(digits) % 2) if digits else False
+    return 'ccw' if (pid_odd == (leg == 'left')) else 'cw'
+
+
 def wait_for_continue() -> bool:
     """y/Enter = continue, q = quit."""
     while True:
@@ -854,97 +891,64 @@ def get_sync_rating() -> int:
             return int(val)
 
 
-def get_resume_start_index(blocknum: int, total_trials: int,
-                           has_two_blocks: bool) -> int:
-    """Prompt resume position and return 0-based trial index to start from."""
+def get_resume_start_index(total_trials: int) -> int:
+    """Prompt resume position and return 0-based trial index to start from.
+
+    With the always-randomized schedule the run is a single interleaved
+    sequence (no a/b blocks), and the (pid, leg) seed in build_trial_plan
+    makes 'trial N' the same trial every restart.
+    """
     ans = input("Resume previous session? (1/0): ").strip()
     if ans != '1':
         return 0
-
-    block = 'a'
-    if has_two_blocks:
-        block = input("Which block (a/b): ").strip().lower()
-
     try:
         trial_num = int(input("Which trial number: ").strip())
     except ValueError:
         return 0
-
-    if trial_num < 1 or trial_num > blocknum:
+    if trial_num < 1 or trial_num > total_trials:
         return 0
-    if block not in ('a', 'b'):
-        return 0
-
-    start_idx = (trial_num - 1) if block == 'a' else (blocknum + trial_num - 1)
-    if start_idx < 0 or start_idx >= total_trials:
-        return 0
-    return start_idx
+    return trial_num - 1
 
 
 def build_trial_plan(blocknum: int,
-                     randomize: bool,
-                     firstblock: str,
                      participant_id: str,
-                     randomize_arr_reg: bool = False,
+                     leg: str,
                      ) -> tuple[list[str], list[bool],
                                 list[int], list[str], str]:
-    """Build all per-trial schedules from one participant-seeded RNG.
+    """Build a balanced, randomized per-trial schedule.
 
     Returns (modalities, attend_high, freq_signs, block_orders, description).
 
-    Within each contiguous modality chunk of `blocknum` trials (or across the
-    whole run when `randomize=True`):
-      - freq_sign (±1) is always counter-balanced 50/50 and shuffled.
-      - block_order is fixed to 'arr_first' unless `randomize_arr_reg=True`,
-        in which case 'arr_first'/'reg_first' is fully crossed with freq_sign
-        (2×2 design, 5 trials per cell at --blocknum 20).
-      - attend_high is balanced 50/50 and shuffled.
+    The schedule is deterministic in (participant_id, leg): restarting with
+    the same PID + leg reproduces the exact same trial sequence, so
+    resume-from-trial-N is well-defined even though modalities/freq/attend
+    are interleaved.
+
+    Total = 2 * blocknum trials, balanced across the 8 cells of
+    (modality × freq_sign × attend_high); every trial uses 'arr_first'.
+    Any remainder when total is not a multiple of 8 is padded with
+    random cells from the same (pid, leg) stream.
     """
-    rng = random.Random(f"participant::{participant_id}")
+    rng = random.Random(f"participant::{participant_id}::leg::{leg}")
 
-    def counterbalance_chunk(n: int) -> tuple[list[int], list[str], list[bool]]:
-        conditions: list[tuple[int, str]] = []
-        if randomize_arr_reg:
-            # 2×2 crossed: freq_sign × block_order
-            per_cell = n // 4
-            for sign in (+1, -1):
-                for order in ('arr_first', 'reg_first'):
-                    conditions.extend([(sign, order)] * per_cell)
-            for _ in range(n - len(conditions)):
-                conditions.append((
-                    rng.choice([+1, -1]),
-                    rng.choice(['arr_first', 'reg_first']),
-                ))
-        else:
-            # Only freq_sign counter-balanced; every trial is 'arr_first'
-            per_cell = n // 2
-            for sign in (+1, -1):
-                conditions.extend([(sign, 'arr_first')] * per_cell)
-            for _ in range(n - len(conditions)):
-                conditions.append((rng.choice([+1, -1]), 'arr_first'))
-        rng.shuffle(conditions)
-        signs  = [c[0] for c in conditions]
-        orders = [c[1] for c in conditions]
+    total = 2 * blocknum
+    cells = [(m, s, a) for m in ('audio', 'vibration')
+                       for s in (+1, -1)
+                       for a in (True, False)]
+    per_cell = total // len(cells)
+    conditions: list[tuple[str, int, bool]] = []
+    for cell in cells:
+        conditions.extend([cell] * per_cell)
+    for _ in range(total - len(conditions)):
+        conditions.append(rng.choice(cells))
+    rng.shuffle(conditions)
 
-        n_high = n // 2 + (1 if (n % 2 and rng.random() < 0.5) else 0)
-        attend = [True] * n_high + [False] * (n - n_high)
-        rng.shuffle(attend)
-        return signs, orders, attend
-
-    if randomize:
-        modalities = [rng.choice(['audio', 'vibration']) for _ in range(blocknum)]
-        signs, orders, attend = counterbalance_chunk(blocknum)
-        mode_desc = f"randomized-seeded ({blocknum} trials)"
-    else:
-        first = firstblock
-        other = 'vibration' if first == 'audio' else 'audio'
-        modalities = [first] * blocknum + [other] * blocknum
-        s1, o1, a1 = counterbalance_chunk(blocknum)
-        s2, o2, a2 = counterbalance_chunk(blocknum)
-        signs  = s1 + s2
-        orders = o1 + o2
-        attend = a1 + a2
-        mode_desc = f"{first} x{blocknum} then {other} x{blocknum}"
+    modalities = [c[0] for c in conditions]
+    signs      = [c[1] for c in conditions]
+    attend     = [c[2] for c in conditions]
+    orders     = ['arr_first'] * total
+    mode_desc  = (f"randomized-balanced ({total} trials, "
+                  f"seed=pid:{participant_id}/leg:{leg})")
 
     return modalities, attend, signs, orders, mode_desc
 
@@ -964,20 +968,24 @@ def main():
         print(sd.query_devices())
         return
 
-    # ── Participant ID ───────────────────────────────────────────────────
+    # ── Participant ID + focus leg ───────────────────────────────────────
     if args.headless:
         participant_id = f"headless"
+        leg            = 'left'
     else:
         participant_id = get_participant_id()
-    print(f"\nParticipant: {participant_id}")
+        leg            = get_focus_leg()
+    ready_dir = _ready_direction(participant_id, leg)
+    print(f"\nParticipant: {participant_id}  "
+          f"(focus leg: {leg}, ready: {ready_dir})")
 
     # ── Parameters ───────────────────────────────────────────────────────
     blocknum          = args.blocknum
     blocktime         = args.blocktime
     freq              = args.freq
     freq_jitter_ratio = args.freq_jitter_ratio
-    effect1           = args.effect1
-    effect2           = args.effect2
+    effect1           = DEFAULT_EFFECT1
+    effect2           = DEFAULT_EFFECT2
 
     # ── Load templates from fixed CSV ────────────────────────────────────
     print(f"\nLoading {NUM_TEMPLATES} arrhythmic templates from "
@@ -1013,30 +1021,27 @@ def main():
 
     # ── Build per-trial schedules ────────────────────────────────────────
     modalities, attention_schedule, freq_signs, block_orders, mode_desc = (
-        build_trial_plan(blocknum, args.randomize, args.firstblock,
-                         participant_id,
-                         randomize_arr_reg=args.randomize_arr_reg)
+        build_trial_plan(blocknum, participant_id, leg)
     )
 
-    total_trials   = len(modalities)
-    has_two_blocks = not args.randomize
+    total_trials = len(modalities)
     if args.headless:
         start_idx = 0
     else:
-        start_idx = get_resume_start_index(blocknum, total_trials, has_two_blocks)
+        start_idx = get_resume_start_index(total_trials)
         if start_idx > 0:
             print(f"Resuming from trial {start_idx + 1}/{total_trials}")
 
     # ── Logger ───────────────────────────────────────────────────────────
-    logger = ExperimentLogger(participant_id)
+    logger = ExperimentLogger(participant_id, focus_leg=leg)
     marker_init(logger_ip, logger=logger)
 
     # ── Pre-load WAV cues ────────────────────────────────────────────────
     words = {}
     for name in ['ignore', 'go',
-                 'attendhigh', 'attendlow',
-                 'attendclick', 'attendbuzz',
-                 'ratesync']:
+                 f'attend{leg}high',  f'attend{leg}low',
+                 f'attend{leg}click', f'attend{leg}buzz',
+                 'ratesync', 'readyccw', 'readycw']:
         try:
             words[name] = load_wav(f'{name}.wav')
             print(f"Loaded {name}.wav ({len(words[name])/SR:.2f}s)")
@@ -1049,22 +1054,28 @@ def main():
     trial_dur   = blocktime * 5
     est_minutes = total_trials * trial_dur / 60
 
-    print(f"\n{'='*60}")
+    print(f"\n{'='*20}")
     print(f"  Participant       : {participant_id}")
     print(f"  Modalities        : {mode_desc}")
     print(f"  Trials            : {total_trials}")
     print(f"  Block time        : {blocktime}s x 5 = {trial_dur}s / trial")
-    if args.randomize_arr_reg:
-        print(f"  Block order       : counter-balanced (arr_first / reg_first)")
-    else:
-        print(f"  Block order       : fixed arr_first "
+
+    print(f"  Block order       : fixed arr_first "
               f"(silent→arr→silent→reg→silent)")
     print(f"  Regular freq      : {freq} Hz ± {freq_jitter_ratio*100:.1f}% "
           f"→ {freq_low:.3f} / {freq_high:.3f} Hz")
     print(f"  Templates         : {NUM_TEMPLATES}")
     print(f"  Est. duration     : ~{est_minutes:.1f} min (excl. rests)")
     print(f"  Log file          : {logger.filename}")
-    print(f"{'='*60}")
+    print(f"{'='*20}")
+
+    # ── Pre-experiment ready cue ─────────────────────────────────────────
+    ready_word = f'ready{ready_dir}'
+    print(f"  Ready cue         : {ready_word}")
+    if not args.headless:
+        play_word(words, ready_word)
+        if not wait_for_continue():
+            return
 
     time.sleep(2)
 
@@ -1081,13 +1092,13 @@ def main():
             attend_high    = attention_schedule[idx]
             freq_delivered = freq_high if freq_sign > 0 else freq_low
 
-            print(f"\n{'─'*50}")
+            print(f"\n{'─'*25}")
             print(f"  Trial {trial_num}/{total_trials}  "
                   f"[{modality.upper()}]  T#{tpl_idx}")
             print(f"    order={block_order}  "
                   f"freq={freq_delivered:.3f}Hz ({'+' if freq_sign > 0 else '-'})  "
                   f"attend={'high' if attend_high else 'low'}")
-            print(f"{'─'*50}")
+            print(f"{'─'*25}")
 
             t0 = perf_counter_raw()
             if modality in ('audio', 'vibration'):
@@ -1101,6 +1112,7 @@ def main():
                     template_index=tpl_idx,
                     block_order=block_order,
                     attend_high=attend_high,
+                    leg=leg,
                     stim_audio=stim_audio,
                     stim_haptic=stim_haptic,
                     words=words,
@@ -1140,30 +1152,18 @@ def parse_args():
         description="Rhythmic cueing experiment",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument('--blocknum',    type=int,   default=12,
-                   help="Trials per modality (or total trials if --randomize)")
+    p.add_argument('--blocknum',    type=int,   default=10,
+                   help="Trials per modality (total = 2 × blocknum, balanced-"
+                        "randomized across modality × freq_sign × attend_high)")
     p.add_argument('--blocktime',   type=float, default=20,
                    help="Duration of each sub-block (s)")
-    p.add_argument('--freq',        type=float, default=1.0,
+    p.add_argument('--freq',        type=float, default=0.83,
                    help="Nominal regular-cue rate (Hz). Delivered rate is "
                         "counter-balanced to freq*(1 ± freq_jitter_ratio).")
     p.add_argument('--freq-jitter-ratio', type=float,
                    default=FREQ_JITTER_RATIO_DEFAULT,
                    help="Fractional jitter applied to --freq on each trial "
                         "(+r on half the trials, -r on the other half)")
-    p.add_argument('--randomize',   action='store_true',
-                   help="Randomize modality per trial instead of blocking")
-    p.add_argument('--randomize-arr-reg', action='store_true',
-                   help="Counter-balance within-trial block order "
-                        "(arr_first / reg_first). Off by default — every "
-                        "trial runs silent→arr→silent→reg→silent.")
-    p.add_argument('--firstblock',  type=str,   default='audio',
-                   choices=['audio', 'vibration'],
-                   help="Modality of the first block when not --randomize")
-    p.add_argument('--effect1',     type=int,   default=DEFAULT_EFFECT1,
-                   help="DRV2605 effect id for the 'low/click' haptic tone")
-    p.add_argument('--effect2',     type=int,   default=DEFAULT_EFFECT2,
-                   help="DRV2605 effect id for the 'high/buzz' haptic tone")
     p.add_argument('--list-devices', action='store_true',
                    help="Print sounddevice devices and exit")
     p.add_argument('--headless',    action='store_true',
