@@ -404,14 +404,31 @@ def load_arrhythmic_templates(path: str,
 
 
 def template_to_haptic_events(template: list,
+                               blocktime_s: float,
                                effect1: int = DEFAULT_EFFECT1,
                                effect2: int = DEFAULT_EFFECT2) -> list:
-    """Convert arrhythmic template → haptic event list [(time, effect_id)]."""
+    """Convert arrhythmic template → haptic event list [(time, effect_id)].
+
+    Drops any event whose TONE_DURATION span would extend past blocktime_s,
+    mirroring build_arrhythmic_audio_from_template's sample-grid truncation
+    so audio and haptic emit the identical set of events for a given
+    (template, blocktime). Filtering happens here at precompute — not inside
+    play_haptic — because live time-checks during playback would add latency
+    in the hot path.
+    """
     tone_dur = TONE_DURATION
+    total_n  = int(round(blocktime_s * SR))
+    tone_n   = max(1, int(round(tone_dur * SR)))
     events = []
     for onset, intra_gap in template:
-        events.append((onset, effect1))
-        events.append((onset + tone_dur + intra_gap, effect2))
+        lo_start = int(round(onset * SR))
+        if lo_start + tone_n <= total_n:
+            events.append((onset, effect1))
+
+        hi_onset = onset + tone_dur + intra_gap
+        hi_start = int(round(hi_onset * SR))
+        if hi_start + tone_n <= total_n:
+            events.append((hi_onset, effect2))
     return events
 
 
@@ -640,7 +657,7 @@ def precompute_stimuli(templates: list, blocktime: float,
         'regular_low':  build_regular_haptic(blocktime, freq_low,  effect1, effect2),
         'regular_high': build_regular_haptic(blocktime, freq_high, effect1, effect2),
         'arrhythmic': [
-            template_to_haptic_events(tpl, effect1, effect2)
+            template_to_haptic_events(tpl, blocktime, effect1, effect2)
             for tpl in templates
         ],
     }
