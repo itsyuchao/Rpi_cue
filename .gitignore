@@ -14,6 +14,7 @@
 *.stats
 *.csv
 *.txt
+.claude/
 
 # Vosk models
 rpi_workshop/vosk_models/

@@ -96,6 +96,8 @@ _UDP_PING_PORT   = 5006
 _PING_K          = 42
 _PING_MOD        = 65536
 _PING_TIMEOUT_S  = 0.5
+_PING_TOLERANCE_MS = 5.0   # if 3rd RTT exceeds this, keep pinging
+_PING_EXTRA_MAX    = 10    # max extra pings before giving up
 
 _marker_sock: _socket.socket | None = None
 _marker_addr: tuple | None = None
@@ -194,10 +196,28 @@ def ping_volley(label: str, trial_num: int | str = ''):
     ping_iso  = datetime.now(timezone.utc).isoformat(timespec='microseconds')
     ping_perf = perf_counter_raw()
     rtts = [_one_ping(label) for _ in range(3)]
+
+    # If the 3rd RTT is over tolerance (or a non-numeric error tag), keep
+    # pinging until one comes back under tolerance, or _PING_EXTRA_MAX extra
+    # pings have fired. Marker emit happens unconditionally in the caller.
+    rtts_additional: list[str] = []
+    def _under_tol(r: str) -> bool:
+        try:
+            return float(r) <= _PING_TOLERANCE_MS
+        except (TypeError, ValueError):
+            return False
+    if not _under_tol(rtts[-1]):
+        for _ in range(_PING_EXTRA_MAX):
+            r = _one_ping(label)
+            rtts_additional.append(r)
+            if _under_tol(r):
+                break
+
     if _logger is not None:
         _logger.log_ping(
             marker_label=label, trial_num=trial_num,
             recv_time_iso=ping_iso, recv_perf_s=ping_perf, rtts=rtts,
+            rtts_additional=rtts_additional,
         )
 
 
@@ -567,6 +587,7 @@ class ExperimentLogger:
         'rtt1_ms',
         'rtt2_ms',
         'rtt3_ms',
+        'rtt_additional',
     ]
 
     def __init__(self, participant_id: str, output_dir: str = 'log',
@@ -616,18 +637,22 @@ class ExperimentLogger:
             attend_high,
             sync_rating,
             marker_label,
-            '', '', '',   # rtt1_ms, rtt2_ms, rtt3_ms
+            '', '', '', '',   # rtt1_ms, rtt2_ms, rtt3_ms, rtt_additional
         ]
         self._append_row(row)
 
     def log_ping(self, *, marker_label: str, trial_num: int | str,
-                 recv_time_iso: str, recv_perf_s: float, rtts: list[str]):
+                 recv_time_iso: str, recv_perf_s: float, rtts: list[str],
+                 rtts_additional: list[str] | None = None):
         """Append one 'ping' row (three-round latency probe for `marker_label`).
         Block-metadata columns are left blank; `rtts` is a 3-element list of
-        RTT strings already formatted in ms (or an error tag)."""
+        RTT strings already formatted in ms (or an error tag). Any RTTs from
+        the tolerance-driven extension loop are stored as a single
+        slash-separated string in `rtt_additional` (empty if none)."""
         r1 = rtts[0] if len(rtts) > 0 else ''
         r2 = rtts[1] if len(rtts) > 1 else ''
         r3 = rtts[2] if len(rtts) > 2 else ''
+        r_add = '/'.join(rtts_additional) if rtts_additional else ''
         row = [
             'ping',
             self.pid,
@@ -636,7 +661,7 @@ class ExperimentLogger:
             f"{recv_perf_s:.6f}",
             '', '', '', '', '',  # template_index, freq_hz, freq_jitter_sign, attend_high, sync_rating
             marker_label,
-            r1, r2, r3,
+            r1, r2, r3, r_add,
         ]
         self._append_row(row)
 
