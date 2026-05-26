@@ -132,22 +132,19 @@ def build_regular_haptic_cycles(n_cycles: int, freq_hz: float,
     return events
 
 
-def play_haptic(events: list, total_s: float):
+def play_haptic(events: list):
+    """Pure spin-wait fire schedule — no time.sleep, no drv.stop().
+    Why: time.sleep is scheduler-jitter-prone (can overshoot the next
+    event); drv.stop() would truncate the final buzz because the
+    library does not expose each built-in effect's duration."""
     if _drv is None or not events:
         return
     t0 = perf_counter_raw()
     for rel_t, effect_id in events:
-        wait = rel_t - (perf_counter_raw() - t0)
-        if wait > 0.002:
-            time.sleep(wait - 0.001)
         while perf_counter_raw() - t0 < rel_t:
             pass
         _drv.sequence[0] = adafruit_drv2605.Effect(effect_id)
         _drv.play()
-    _drv.stop()
-    remaining = total_s - (perf_counter_raw() - t0)
-    if remaining > 0:
-        time.sleep(remaining)
 
 
 # ── Main loop ────────────────────────────────────────────────────────────────
@@ -184,7 +181,7 @@ def main():
                 if _drv is None:
                     print("  [HAPTIC] No driver — skipping")
                 else:
-                    play_haptic(haptic_events, total_s)
+                    play_haptic(haptic_events)
             else:
                 print("  (ignored — type 'a' or 'v')")
     except KeyboardInterrupt:
