@@ -588,6 +588,7 @@ class ExperimentLogger:
         'rtt2_ms',
         'rtt3_ms',
         'rtt_additional',
+        'gostop_pause_s',
     ]
 
     def __init__(self, participant_id: str, output_dir: str = 'log',
@@ -638,6 +639,7 @@ class ExperimentLogger:
             sync_rating,
             marker_label,
             '', '', '', '',   # rtt1_ms, rtt2_ms, rtt3_ms, rtt_additional
+            '',               # gostop_pause_s
         ]
         self._append_row(row)
 
@@ -662,6 +664,29 @@ class ExperimentLogger:
             '', '', '', '', '',  # template_index, freq_hz, freq_jitter_sign, attend_high, sync_rating
             marker_label,
             r1, r2, r3, r_add,
+            '',                  # gostop_pause_s
+        ]
+        self._append_row(row)
+
+    def log_gostop(self, *, trial_num: int, marker_label: str,
+                   recv_time_iso: str, recv_perf_s: float,
+                   gostop_pause_s: float):
+        """Append one 'gostop' row marking the go.wav / stop.wav play moment.
+
+        Logged for block 0 (go.wav, with the pre-go pause) and block 5
+        (stop.wav, with the post-stop pause before ratesync). recv_time_iso /
+        recv_perf_s are captured immediately before the play call.
+        """
+        row = [
+            'gostop',
+            self.pid,
+            trial_num,
+            recv_time_iso,
+            f"{recv_perf_s:.6f}",
+            '', '', '', '', '',  # template_index, freq_hz, freq_jitter_sign, attend_high, sync_rating
+            marker_label,
+            '', '', '', '',      # rtt1_ms, rtt2_ms, rtt3_ms, rtt_additional
+            f"{gostop_pause_s:.6f}",
         ]
         self._append_row(row)
 
@@ -770,9 +795,23 @@ def run_trial(*,
         attend_word = f'attend{leg}click' if attend_high else f'attend{leg}buzz'
 
     # ── Preamble ─────────────────────────────────────────────────────────
+    # Pre-go pause is generated once so the same value can be both slept and
+    # logged in the 'gostop' row alongside the go.wav play timestamp.
     play_word(words, 'ignore')
-    time.sleep(max(0.5, 2.0 + random.uniform(-0.5, 0.5)))
+    pre_go_pause = max(0.5, 2.0 + random.uniform(-0.5, 0.5))
+    time.sleep(pre_go_pause)
+    go_recv_time_iso = datetime.now(timezone.utc).isoformat(
+        timespec='microseconds'
+    )
+    go_recv_perf_s = perf_counter_raw()
     play_word(words, 'go')
+    logger.log_gostop(
+        trial_num=trial_num,
+        marker_label=f"{mod_marker}_go_p0_t{trial_num}",
+        recv_time_iso=go_recv_time_iso,
+        recv_perf_s=go_recv_perf_s,
+        gostop_pause_s=pre_go_pause,
+    )
 
     # ── Run the 6 sub-blocks ─────────────────────────────────────────────
     n_pairs = len(template)
@@ -841,6 +880,24 @@ def run_trial(*,
             else:
                 play_haptic_block(_drv, h_regular, cueblocktime)
         else:  # 'rate'
+            # Stop.wav plays first (so its onset is tied to the block-5
+            # marker), then a 2±0.5 s pause, then ratesync + rating. The
+            # pause value is generated once so the same number is both
+            # slept and logged in the 'gostop' row.
+            stop_recv_time_iso = datetime.now(timezone.utc).isoformat(
+                timespec='microseconds'
+            )
+            stop_recv_perf_s = perf_counter_raw()
+            play_word(words, 'stop')
+            post_stop_pause = max(0.5, 2.0 + random.uniform(-0.5, 0.5))
+            logger.log_gostop(
+                trial_num=trial_num,
+                marker_label=f"{mod_marker}_stop_p5_t{trial_num}",
+                recv_time_iso=stop_recv_time_iso,
+                recv_perf_s=stop_recv_perf_s,
+                gostop_pause_s=post_stop_pause,
+            )
+            time.sleep(post_stop_pause)
             if not headless:
                 play_word(words, 'ratesync')
                 sync_rating = get_sync_rating()
@@ -1066,7 +1123,7 @@ def main():
     # ── Pre-load WAV cues ────────────────────────────────────────────────
     words = {}
     loaded_names = []
-    for name in ['ignore', 'go',
+    for name in ['ignore', 'go', 'stop',
                  f'attend{leg}high',  f'attend{leg}low',
                  f'attend{leg}click', f'attend{leg}buzz',
                  'ratesync', 'readyccw', 'readycw']:
