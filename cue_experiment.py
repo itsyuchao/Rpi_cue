@@ -2,7 +2,7 @@
 """
 cue_experiment.py
 =================
-Rhythmic cueing experiment controller for Raspberry Pi 4.
+Rhythmic cueing experiment controller for Raspberry Pi 3.
 
 Hardware
 --------
@@ -13,8 +13,7 @@ Operator console
 ----------------
   All operator I/O (subject ID, focus leg, resume prompt, ready-cue
   confirmation, between-trial continue, sync rating) goes through the
-  controlling terminal. An RF-dongle USB keyboard plugs into this Pi for
-  that purpose; there is no on-Pi LCD/OLED or membrane keypad.
+  controlling terminal (PiTFT). An RF-dongle USB keyboard plugs into Pi.
 
 Pre-experiment
 --------------
@@ -37,17 +36,17 @@ Trial structure (1 baseline silent + 4 cue sub-blocks + 1 rate sub-block)
   --cueblocktime seconds long. The rate block runs as long as it takes
   the operator to type the rating.
 
-  The delivered regular-cue rate is counter-balanced per modality between
-  freq*(1-freq_jitter_ratio) and freq*(1+freq_jitter_ratio). With the
-  defaults (--blocknum 20, --freq 0.83, --freq-jitter-ratio 0.1) that is
-  10 trials at 0.73 Hz and 10 trials at 0.93 Hz per modality, with a balanced
-  attend-high / attend-low split.
+  The delivered regular-cue period is counter-balanced per modality between
+  dur_s-dur_s_jitter and dur_s+dur_s_jitter. With the
+  defaults (--blocknum 8, --dur-s 1.2, --dur-s-jitter 0.15) that is
+  8 trials at 1.05 s and 8 trials at 1.35 s across modality, with a
+  balanced attend-high / attend-low split.
 
   The attention cue ('attend{leg}high'/'attend{leg}low' or
   'attend{leg}click'/'attend{leg}buzz') always plays immediately before
   the regular block, where {leg} is the per-session focused leg.
 
-  The rate sub-block plays 'ratesync.wav' and the operator enters a 1-5
+  The rate sub-block plays 'ratesync.wav' and the operator enters a 0-9
   sync rating at the terminal; the rating lands in the rate row's
   sync_rating column. It uses the same ping/marker/log path as the
   stimulation blocks (no special case). In headless mode the rate ping
@@ -262,10 +261,10 @@ RELEASE_MS = 20
 HARMONICS  = [(1, 1.00), (2, 0.30), (3, 0.15), (4, 0.10)]
 TONE_DURATION = 0.15
 
-# Regular-cue frequency jitter — the delivered rate is
-#   freq * (1 ± FREQ_JITTER_RATIO_DEFAULT)
+# Regular-cue period jitter — the delivered period is
+#   dur_s ± DUR_S_JITTER_DEFAULT  (seconds)
 # counter-balanced across trials (see build_trial_plan).
-FREQ_JITTER_RATIO_DEFAULT = 0.1
+DUR_S_JITTER_DEFAULT = 0.15
 
 # Templates
 NUM_TEMPLATES = 20
@@ -356,9 +355,9 @@ def play_word(words: dict, name: str):
 # Module 4 — Audio waveform builders
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_regular_audio(blocktime_s: float, freq_hz: float) -> np.ndarray:
-    """Regular alternating A4/E5 at freq_hz for blocktime_s."""
-    half   = 0.5 / freq_hz
+def build_regular_audio(blocktime_s: float, dur_s: float) -> np.ndarray:
+    """Regular alternating A4/E5 with cycle period dur_s for blocktime_s."""
+    half   = dur_s / 2
     tone_d = TONE_DURATION
     gap_d  = half - tone_d
     cycle  = np.concatenate([
@@ -516,11 +515,11 @@ def play_haptic_event(drv, effect_id: int):
     drv.stop()
 
 
-def build_regular_haptic(blocktime_s: float, freq_hz: float,
+def build_regular_haptic(blocktime_s: float, dur_s: float,
                           effect1: int = DEFAULT_EFFECT1,
                           effect2: int = DEFAULT_EFFECT2) -> list:
-    """Alternating effect1/effect2 at freq_hz for blocktime_s."""
-    half   = 0.5 / freq_hz
+    """Alternating effect1/effect2 with cycle period dur_s for blocktime_s."""
+    half   = dur_s / 2
     events = []
     t      = 0.0
     while t < blocktime_s - 1e-9:
@@ -542,8 +541,8 @@ class ExperimentLogger:
 
     Columns with limited scope are left blank when not applicable:
       - template_index    : only for arrhythmic blocks
-      - freq_hz           : only for regular blocks (delivered frequency)
-      - freq_jitter_sign  : only for regular blocks (+1 / -1)
+      - dur_s             : only for regular blocks (delivered cycle period, s)
+      - dur_jitter_sign   : only for regular blocks (+1 / -1)
       - sync_rating       : only for the final silent block of each trial
 
     marker_label encodes modality / block_subtype / block_position / trial_num
@@ -579,8 +578,8 @@ class ExperimentLogger:
         'recv_time_iso',
         'recv_perf_s',
         'template_index',
-        'freq_hz',
-        'freq_jitter_sign',
+        'dur_s',
+        'dur_jitter_sign',
         'attend_high',
         'sync_rating',
         'marker_label',
@@ -615,8 +614,8 @@ class ExperimentLogger:
     def log_block(self, *, trial_num: int, marker_label: str,
                   attend_high: bool,
                   template_index: int | str = '',
-                  freq_hz: float | str = '',
-                  freq_jitter_sign: int | str = '',
+                  dur_s: float | str = '',
+                  dur_jitter_sign: int | str = '',
                   sync_rating: int | str = '',
                   recv_time_iso: str | None = None,
                   recv_perf_s: float | None = None):
@@ -633,8 +632,8 @@ class ExperimentLogger:
             recv_time_iso,
             f"{recv_perf_s:.6f}",
             template_index,
-            freq_hz,
-            freq_jitter_sign,
+            dur_s,
+            dur_jitter_sign,
             attend_high,
             sync_rating,
             marker_label,
@@ -661,7 +660,7 @@ class ExperimentLogger:
             trial_num,
             recv_time_iso,
             f"{recv_perf_s:.6f}",
-            '', '', '', '', '',  # template_index, freq_hz, freq_jitter_sign, attend_high, sync_rating
+            '', '', '', '', '',  # template_index, dur_s, dur_jitter_sign, attend_high, sync_rating
             marker_label,
             r1, r2, r3, r_add,
             '',                  # gostop_pause_s
@@ -683,7 +682,7 @@ class ExperimentLogger:
             trial_num,
             recv_time_iso,
             f"{recv_perf_s:.6f}",
-            '', '', '', '', '',  # template_index, freq_hz, freq_jitter_sign, attend_high, sync_rating
+            '', '', '', '', '',  # template_index, dur_s, dur_jitter_sign, attend_high, sync_rating
             marker_label,
             '', '', '', '',      # rtt1_ms, rtt2_ms, rtt3_ms, rtt_additional
             f"{gostop_pause_s:.6f}",
@@ -697,7 +696,7 @@ class ExperimentLogger:
 
 def precompute_stimuli(templates: list,
                        cueblocktime: float,
-                       freq: float, freq_jitter_ratio: float,
+                       dur_s: float, dur_s_jitter: float,
                        effect1: int, effect2: int
                        ) -> tuple[dict, dict, float, float]:
     """Build every waveform and haptic schedule that trials will need.
@@ -706,29 +705,29 @@ def precompute_stimuli(templates: list,
     Silent blocks are just `time.sleep(...)` in the runner — no waveform
     needed for either modality.
 
-    Returns (audio, haptic, freq_low, freq_high). During trials, the runner
+    Returns (audio, haptic, dur_low, dur_high). During trials, the runner
     only selects a precomputed object — no synthesis happens in the hot path.
     """
-    freq_low  = freq * (1.0 - freq_jitter_ratio)
-    freq_high = freq * (1.0 + freq_jitter_ratio)
+    dur_low  = dur_s - dur_s_jitter
+    dur_high = dur_s + dur_s_jitter
 
     audio = {
-        'regular_low':  build_regular_audio(cueblocktime, freq_low),
-        'regular_high': build_regular_audio(cueblocktime, freq_high),
+        'regular_low':  build_regular_audio(cueblocktime, dur_low),
+        'regular_high': build_regular_audio(cueblocktime, dur_high),
         'arrhythmic': [
             build_arrhythmic_audio_from_template(tpl, cueblocktime)
             for tpl in templates
         ],
     }
     haptic = {
-        'regular_low':  build_regular_haptic(cueblocktime, freq_low,  effect1, effect2),
-        'regular_high': build_regular_haptic(cueblocktime, freq_high, effect1, effect2),
+        'regular_low':  build_regular_haptic(cueblocktime, dur_low,  effect1, effect2),
+        'regular_high': build_regular_haptic(cueblocktime, dur_high, effect1, effect2),
         'arrhythmic': [
             template_to_haptic_events(tpl, cueblocktime, effect1, effect2)
             for tpl in templates
         ],
     }
-    return audio, haptic, freq_low, freq_high
+    return audio, haptic, dur_low, dur_high
 
 
 def run_trial(*,
@@ -736,8 +735,8 @@ def run_trial(*,
               trial_num: int,
               baseblocktime: float,
               cueblocktime: float,
-              freq_hz: float,
-              freq_jitter_sign: int,
+              dur_s: float,
+              dur_jitter_sign: int,
               template: list,
               template_index: int,
               attend_high: bool,
@@ -769,19 +768,19 @@ def run_trial(*,
     """
     is_audio   = (modality == 'audio')
     mod_marker = 'a' if is_audio else 'v'
-    freq_key   = 'regular_high' if freq_jitter_sign > 0 else 'regular_low'
+    dur_key    = 'regular_high' if dur_jitter_sign > 0 else 'regular_low'
 
     # ── Pick stimuli ─────────────────────────────────────────────────────
     if is_audio:
         w_arrhythm = stim_audio['arrhythmic'][template_index]
-        w_regular  = stim_audio[freq_key]
+        w_regular  = stim_audio[dur_key]
     else:
         if _drv is None:
             print("    [HAPTIC] No driver — skipping vibration trial")
             time.sleep(baseblocktime + cueblocktime * 4)
             return
         h_arrhythm = stim_haptic['arrhythmic'][template_index]
-        h_regular  = stim_haptic[freq_key]
+        h_regular  = stim_haptic[dur_key]
 
     # ── Block layout for this trial ──────────────────────────────────────
     # Fixed order (arrhythmic always first). Subtype tokens match the
@@ -798,13 +797,12 @@ def run_trial(*,
     # Pre-go pause is generated once so the same value can be both slept and
     # logged in the 'gostop' row alongside the go.wav play timestamp.
     play_word(words, 'ignore')
-    pre_go_pause = max(0.5, 2.0 + random.uniform(-0.5, 0.5))
+    pre_go_pause = 2.0 + random.uniform(-0.5, 0.5)
     time.sleep(pre_go_pause)
     go_recv_time_iso = datetime.now(timezone.utc).isoformat(
         timespec='microseconds'
     )
     go_recv_perf_s = perf_counter_raw()
-    play_word(words, 'go')
     logger.log_gostop(
         trial_num=trial_num,
         marker_label=f"{mod_marker}_go_p0_t{trial_num}",
@@ -812,6 +810,7 @@ def run_trial(*,
         recv_perf_s=go_recv_perf_s,
         gostop_pause_s=pre_go_pause,
     )
+    play_word(words, 'go')
 
     # ── Run the 6 sub-blocks ─────────────────────────────────────────────
     n_pairs = len(template)
@@ -835,19 +834,19 @@ def run_trial(*,
 
         # Per-block metadata for the logger
         if subtype == 'sil':
-            tpl_log = freq_log = freq_sign_log = ''
+            tpl_log = dur_log = dur_sign_log = ''
             desc = 'silent'
         elif subtype == 'arr':
             tpl_log = template_index
-            freq_log = freq_sign_log = ''
+            dur_log = dur_sign_log = ''
             desc = f"arrhythmic ({n_pairs} pairs)"
         elif subtype == 'reg':
             tpl_log = ''
-            freq_log = f"{freq_hz:.6f}"
-            freq_sign_log = freq_jitter_sign
-            desc = f"regular {freq_hz:.3f}Hz"
+            dur_log = f"{dur_s:.6f}"
+            dur_sign_log = dur_jitter_sign
+            desc = f"regular {dur_s:.3f}s"
         else:  # 'rate'
-            tpl_log = freq_log = freq_sign_log = ''
+            tpl_log = dur_log = dur_sign_log = ''
             desc = 'rate'
 
         print(f"    Block {position}: {desc}")
@@ -888,8 +887,6 @@ def run_trial(*,
                 timespec='microseconds'
             )
             stop_recv_perf_s = perf_counter_raw()
-            play_word(words, 'stop')
-            post_stop_pause = max(0.5, 2.0 + random.uniform(-0.5, 0.5))
             logger.log_gostop(
                 trial_num=trial_num,
                 marker_label=f"{mod_marker}_stop_p5_t{trial_num}",
@@ -897,6 +894,9 @@ def run_trial(*,
                 recv_perf_s=stop_recv_perf_s,
                 gostop_pause_s=post_stop_pause,
             )
+            play_word(words, 'stop')
+            post_stop_pause = 2.0 + random.uniform(-0.5, 0.5)
+
             time.sleep(post_stop_pause)
             if not headless:
                 play_word(words, 'ratesync')
@@ -908,8 +908,8 @@ def run_trial(*,
             marker_label=marker,
             attend_high=attend_high,
             template_index=tpl_log,
-            freq_hz=freq_log,
-            freq_jitter_sign=freq_sign_log,
+            dur_s=dur_log,
+            dur_jitter_sign=dur_sign_log,
             sync_rating=sync_rating,
             recv_time_iso=block_recv_time_iso,
             recv_perf_s=block_recv_perf_s,
@@ -967,13 +967,13 @@ def wait_for_continue() -> bool:
 
 
 def get_sync_rating() -> int:
-    """Collect a 1-5 sync rating after ratesync."""
+    """Collect a 0-9 sync rating after ratesync."""
     while True:
         try:
-            val = input("  >> Sync rating (1-5): ").strip()
+            val = input("  >> Sync rating (0-9): ").strip()
         except EOFError:
             return 0
-        if val in {'1', '2', '3', '4', '5'}:
+        if val in {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9'}:
             return int(val)
 
 
@@ -1002,15 +1002,15 @@ def build_trial_plan(blocknum: int,
                      ) -> tuple[list[str], list[bool], list[int]]:
     """Build a balanced, randomized per-trial schedule.
 
-    Returns (modalities, attend_high, freq_signs).
+    Returns (modalities, attend_high, dur_signs).
 
     The schedule is deterministic in (participant_id, leg): restarting with
     the same PID + leg reproduces the exact same trial sequence, so
-    resume-from-trial-N is well-defined even though modalities/freq/attend
+    resume-from-trial-N is well-defined even though modalities/dur/attend
     are interleaved.
 
     Total = 2 * blocknum trials, balanced across the 8 cells of
-    (modality × freq_sign × attend_high). Block order is fixed
+    (modality × dur_sign × attend_high). Block order is fixed
     (arrhythmic always first) so it is not part of the schedule.
     Any remainder when total is not a multiple of 8 is padded with
     random cells from the same (pid, leg) stream.
@@ -1066,8 +1066,8 @@ def main():
     blocknum          = args.blocknum
     baseblocktime     = args.baseblocktime
     cueblocktime      = args.cueblocktime
-    freq              = args.freq
-    freq_jitter_ratio = args.freq_jitter_ratio
+    dur_s             = args.dur_s
+    dur_s_jitter      = args.dur_s_jitter
     effect1           = DEFAULT_EFFECT1
     effect2           = DEFAULT_EFFECT2
 
@@ -1097,14 +1097,14 @@ def main():
     # ── Precompute every stimulus up front (low-latency trials) ──────────
     print("\nPrecomputing audio & haptic stimuli...", flush=True)
     t_pre = perf_counter_raw()
-    stim_audio, stim_haptic, freq_low, freq_high = precompute_stimuli(
-        templates, cueblocktime, freq, freq_jitter_ratio, effect1, effect2,
+    stim_audio, stim_haptic, dur_low, dur_high = precompute_stimuli(
+        templates, cueblocktime, dur_s, dur_s_jitter, effect1, effect2,
     )
     print(f"  Done in {perf_counter_raw() - t_pre:.2f}s "
-          f"(regular rates: {freq_low:.3f} / {freq_high:.3f} Hz)")
+          f"(regular periods: {dur_low:.3f} / {dur_high:.3f} s)")
 
     # ── Build per-trial schedules ────────────────────────────────────────
-    modalities, attention_schedule, freq_signs = (
+    modalities, attention_schedule, dur_signs = (
         build_trial_plan(blocknum, participant_id, leg)
     )
 
@@ -1145,7 +1145,7 @@ def main():
     print(f"\n{'='*20}")
     print(f"  Participant   : {participant_id}")
     print(f"  Trials    : {total_trials}")
-    print(f"  Regular freq  : {freq} Hz ± {freq_jitter_ratio*100:.1f}% ")
+    print(f"  Regular period: {dur_s} s ± {dur_s_jitter} s ")
     print(f"  Est. duration : ~{est_minutes:.1f} min")
     print(f"{'='*20}")
 
@@ -1167,14 +1167,14 @@ def main():
             tpl_idx        = idx % NUM_TEMPLATES
             template       = templates[tpl_idx]
             trial_num      = idx + 1
-            freq_sign      = freq_signs[idx]
+            dur_sign       = dur_signs[idx]
             attend_high    = attention_schedule[idx]
-            freq_delivered = freq_high if freq_sign > 0 else freq_low
+            dur_delivered  = dur_high if dur_sign > 0 else dur_low
 
             print(f"\n{'─'*20}")
             print(f"T#{trial_num}/{total_trials}  "
                   f"[{modality.upper()}] "
-                  f"f={freq_delivered:.3f}Hz ({'+' if freq_sign > 0 else '-'})  "
+                  f"dur={dur_delivered:.3f}s ({'+' if dur_sign > 0 else '-'})  "
                   f"attn={'high' if attend_high else 'low'}")
             print(f"{'─'*20}")
 
@@ -1185,8 +1185,8 @@ def main():
                     trial_num=trial_num,
                     baseblocktime=baseblocktime,
                     cueblocktime=cueblocktime,
-                    freq_hz=freq_delivered,
-                    freq_jitter_sign=freq_sign,
+                    dur_s=dur_delivered,
+                    dur_jitter_sign=dur_sign,
                     template=template,
                     template_index=tpl_idx,
                     attend_high=attend_high,
@@ -1230,22 +1230,22 @@ def parse_args():
         description="Rhythmic cueing experiment",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument('--blocknum',    type=int,   default=10,
+    p.add_argument('--blocknum',    type=int,   default=8,
                    help="Trials per modality (total = 2 × blocknum, balanced-"
-                        "randomized across modality × freq_sign × attend_high)")
+                        "randomized across modality × dur_sign × attend_high)")
     p.add_argument('--baseblocktime', type=float, default=10,
                    help="Duration of the baseline silent block at position 0 (s)")
     p.add_argument('--cueblocktime',  type=float, default=20,
                    help="Duration of each cue / post-cue silent sub-block "
                         "at positions 1-4 (s). Arrhythmic templates must be "
                         "generated for this duration.")
-    p.add_argument('--freq',        type=float, default=0.83,
-                   help="Nominal regular-cue rate (Hz). Delivered rate is "
-                        "counter-balanced to freq*(1 ± freq_jitter_ratio).")
-    p.add_argument('--freq-jitter-ratio', type=float,
-                   default=FREQ_JITTER_RATIO_DEFAULT,
-                   help="Fractional jitter applied to --freq on each trial "
-                        "(+r on half the trials, -r on the other half)")
+    p.add_argument('--dur-s',       type=float, default=1.2,
+                   help="Nominal regular-cue cycle period (s). Delivered "
+                        "period is counter-balanced to dur_s ± dur_s_jitter.")
+    p.add_argument('--dur-s-jitter', type=float,
+                   default=DUR_S_JITTER_DEFAULT,
+                   help="Absolute jitter (s) applied to --dur-s on each trial "
+                        "(+j on half the trials, -j on the other half)")
     p.add_argument('--list-devices', action='store_true',
                    help="Print sounddevice devices and exit")
     p.add_argument('--headless',    action='store_true',
