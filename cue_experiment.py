@@ -887,6 +887,7 @@ def run_trial(*,
                 timespec='microseconds'
             )
             stop_recv_perf_s = perf_counter_raw()
+            post_stop_pause = 2.0 + random.uniform(-0.5, 0.5)
             logger.log_gostop(
                 trial_num=trial_num,
                 marker_label=f"{mod_marker}_stop_p5_t{trial_num}",
@@ -895,9 +896,8 @@ def run_trial(*,
                 gostop_pause_s=post_stop_pause,
             )
             play_word(words, 'stop')
-            post_stop_pause = 2.0 + random.uniform(-0.5, 0.5)
-
             time.sleep(post_stop_pause)
+            
             if not headless:
                 play_word(words, 'ratesync')
                 sync_rating = get_sync_rating()
