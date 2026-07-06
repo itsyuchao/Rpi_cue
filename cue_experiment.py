@@ -231,7 +231,7 @@ def send_marker_packet(label: str):
         pass
 
 
-logger_ip = "192.168.50.13"
+logger_ip = "192.168.50.15"
 # ══════════════════════════════════════════════════════════════════════════════
 # Module 1 — Hardware imports (graceful fallback)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -797,7 +797,7 @@ def run_trial(*,
     # Pre-go pause is generated once so the same value can be both slept and
     # logged in the 'gostop' row alongside the go.wav play timestamp.
     play_word(words, 'ignore')
-    pre_go_pause = 2.0 + random.uniform(-0.5, 0.5)
+    pre_go_pause = 3.0 + random.uniform(-1, 1)
     time.sleep(pre_go_pause)
     go_recv_time_iso = datetime.now(timezone.utc).isoformat(
         timespec='microseconds'
@@ -880,14 +880,14 @@ def run_trial(*,
                 play_haptic_block(_drv, h_regular, cueblocktime)
         else:  # 'rate'
             # Stop.wav plays first (so its onset is tied to the block-5
-            # marker), then a 2±0.5 s pause, then ratesync + rating. The
+            # marker), then a 3±1 s pause, then ratesync + rating. The
             # pause value is generated once so the same number is both
             # slept and logged in the 'gostop' row.
             stop_recv_time_iso = datetime.now(timezone.utc).isoformat(
                 timespec='microseconds'
             )
             stop_recv_perf_s = perf_counter_raw()
-            post_stop_pause = 2.0 + random.uniform(-0.5, 0.5)
+            post_stop_pause = 3.0 + random.uniform(-1, 1)
             logger.log_gostop(
                 trial_num=trial_num,
                 marker_label=f"{mod_marker}_stop_p5_t{trial_num}",
