@@ -46,12 +46,14 @@ Trial structure (1 baseline silent + 4 cue sub-blocks + 1 rate sub-block)
   'attend{leg}click'/'attend{leg}buzz') always plays immediately before
   the regular block, where {leg} is the per-session focused leg.
 
-  The rate sub-block plays 'ratesync.wav' and the operator enters a 0-9
-  sync rating at the terminal; the rating lands in the rate row's
-  sync_rating column. It uses the same ping/marker/log path as the
-  stimulation blocks (no special case). In headless mode the rate ping
-  and marker still emit, but the ratesync prompt and rating collection
-  are skipped.
+  In the rate sub-block 'stop.wav' plays (logged as a 'gostop' row), then
+  a 3±1 s pause, then 'ratesync.wav' — all BEFORE the block's ping volley
+  and marker. WAVs loaded from disk are operator/participant instructions,
+  not cues, so the block-5 marker/timestamps bracket only the rating
+  collection. The operator enters a 0-9 sync rating at the terminal; the
+  rating lands in the rate row's sync_rating column. In headless mode the
+  rate ping and marker still emit, but the ratesync prompt and rating
+  collection are skipped.
 
 Per-block network protocol
 --------------------------
@@ -61,6 +63,13 @@ Per-block network protocol
     2. Capture block-start recv_time_iso + recv_perf_s and emit the marker
        UDP packet on the now-warm path.
     3. Begin stimulation.
+
+  Instruction WAVs (ignore/go/attend*/stop/ratesync) always play before
+  step 1, so the marker and block timestamps bracket only the actual
+  stimulation (or rating) window. All waveforms are pre-padded with 50 ms
+  of startup silence at build/load time; audio onsets therefore lag the
+  block timestamp by that fixed 50 ms plus device latency
+  (sd.default.latency = 'low').
 
   Putting the volley before the marker emit gives the marker packet the
   lowest-latency, highest-reliability slot in the sequence. Column names
@@ -287,6 +296,7 @@ def audio_init():
     sd.default.samplerate = SR
     sd.default.channels   = 1
     sd.default.dtype      = 'float32'
+    #sd.default.latency    = 'low'
     for i, dev in enumerate(sd.query_devices()):
         if 'hifiberry' in dev['name'].lower():
             sd.default.device = i
@@ -295,8 +305,15 @@ def audio_init():
     print("WARNING: HiFiBerry not found — using system default")
 
 
+def _pad_startup(audio: np.ndarray, ms: float = 50) -> np.ndarray:
+    """Prepend startup silence. Applied once at build/load time so play_audio
+    does no copying in the hot path; audio onsets lag block timestamps by
+    this fixed pad plus device latency."""
+    return np.concatenate([_silence(ms / 1000), audio])
+
+
 def load_wav(path: str) -> np.ndarray:
-    """Load WAV → float32 mono at SR."""
+    """Load WAV → float32 mono at SR, pre-padded with startup silence."""
     sr_in, data = wav.read(f"audio/{path}")
     if data.dtype == np.int16:
         data = data.astype(np.float32) / 32768.0
@@ -308,7 +325,7 @@ def load_wav(path: str) -> np.ndarray:
         n_out   = int(len(data) * SR / sr_in)
         indices = np.round(np.linspace(0, len(data) - 1, n_out)).astype(int)
         data    = data[indices]
-    return data.astype(np.float32)
+    return _pad_startup(data.astype(np.float32))
 
 
 def _silence(dur_s: float) -> np.ndarray:
@@ -332,13 +349,9 @@ def _synth_tone(freq: float, dur_s: float) -> np.ndarray:
     return y.astype(np.float32)
 
 
-def _pad_startup(audio: np.ndarray, ms: float = 50) -> np.ndarray:
-    return np.concatenate([_silence(ms / 1000), audio])
-
-
 def play_audio(waveform: np.ndarray, blocking: bool = True):
-    """Play a precomputed waveform with padded start for buffering."""
-    sd.play(_pad_startup(waveform), samplerate=SR, blocksize=128)
+    """Play a waveform already padded at build/load time (_pad_startup)."""
+    sd.play(waveform, samplerate=SR, blocksize=128)
     if blocking:
         sd.wait()
 
@@ -543,7 +556,7 @@ class ExperimentLogger:
       - template_index    : only for arrhythmic blocks
       - dur_s             : only for regular blocks (delivered cycle period, s)
       - dur_jitter_sign   : only for regular blocks (+1 / -1)
-      - sync_rating       : only for the final silent block of each trial
+      - sync_rating       : only for the rate block of each trial
 
     marker_label encodes modality / block_subtype / block_position / trial_num
     ('{a|v}_{sil|arr|reg|rate}_p{pos}_t{trial}'), so those fields are not
@@ -674,7 +687,9 @@ class ExperimentLogger:
 
         Logged for block 0 (go.wav, with the pre-go pause) and block 5
         (stop.wav, with the post-stop pause before ratesync). recv_time_iso /
-        recv_perf_s are captured immediately before the play call.
+        recv_perf_s are captured immediately before the play call; the row
+        itself is appended after playback so the CSV fsync never sits
+        between timestamp capture and wav onset.
         """
         row = [
             'gostop',
@@ -706,18 +721,22 @@ def precompute_stimuli(templates: list,
     needed for either modality.
 
     Returns (audio, haptic, dur_low, dur_high). During trials, the runner
-    only selects a precomputed object — no synthesis happens in the hot path.
+    only selects a precomputed object — no synthesis, padding, or copying
+    happens in the hot path. Every audio buffer (including the attention
+    tones) is pre-padded here with the 50 ms startup silence.
     """
     dur_low  = dur_s - dur_s_jitter
     dur_high = dur_s + dur_s_jitter
 
     audio = {
-        'regular_low':  build_regular_audio(cueblocktime, dur_low),
-        'regular_high': build_regular_audio(cueblocktime, dur_high),
+        'regular_low':  _pad_startup(build_regular_audio(cueblocktime, dur_low)),
+        'regular_high': _pad_startup(build_regular_audio(cueblocktime, dur_high)),
         'arrhythmic': [
-            build_arrhythmic_audio_from_template(tpl, cueblocktime)
+            _pad_startup(build_arrhythmic_audio_from_template(tpl, cueblocktime))
             for tpl in templates
         ],
+        'attend_tone_high': _pad_startup(_synth_tone(F_HIGH, 0.5)),
+        'attend_tone_low':  _pad_startup(_synth_tone(F_LOW,  0.5)),
     }
     haptic = {
         'regular_low':  build_regular_haptic(cueblocktime, dur_low,  effect1, effect2),
@@ -755,16 +774,17 @@ def run_trial(*,
                  p0=silent (baseblocktime), p1=arrhythmic (cueblocktime),
                  p2=silent (cueblocktime),  p3=regular   (cueblocktime),
                  p4=silent (cueblocktime),  p5=rate.
-               Position 5 is the rate block: 'ratesync' plays and the
-               operator enters a 1-5 sync rating at the terminal (skipped
-               in headless mode). It uses the same ping/marker/log path
-               as the stimulation blocks; the rating lands in the rate
+               Position 5 is the rate block: 'stop' (gostop row) → 3±1 s
+               pause → 'ratesync' all play before the volley/marker, then
+               the operator enters a 0-9 sync rating at the terminal
+               (skipped in headless mode); the rating lands in the rate
                row's sync_rating column.
-    Per-block: ping_volley() → capture recv_time_iso + recv_perf_s →
-               send_marker_packet() → play stimulus → log_block. The pings
-               warm the network path so the marker UDP arrives with the
-               lowest possible latency.
-    Attention: plays immediately before the regular block.
+    Per-block: instruction WAVs (if any) → ping_volley() → capture
+               recv_time_iso + recv_perf_s → send_marker_packet() → play
+               stimulus → log_block. The pings warm the network path so
+               the marker UDP arrives with the lowest possible latency.
+    Attention: plays immediately before the regular block (before its
+               volley/marker).
     """
     is_audio   = (modality == 'audio')
     mod_marker = 'a' if is_audio else 'v'
@@ -795,7 +815,9 @@ def run_trial(*,
 
     # ── Preamble ─────────────────────────────────────────────────────────
     # Pre-go pause is generated once so the same value can be both slept and
-    # logged in the 'gostop' row alongside the go.wav play timestamp.
+    # logged in the 'gostop' row alongside the go.wav play timestamp. The
+    # row is appended AFTER the play so the CSV fsync never sits between
+    # timestamp capture and go.wav onset.
     play_word(words, 'ignore')
     pre_go_pause = 3.0 + random.uniform(-1, 1)
     time.sleep(pre_go_pause)
@@ -803,6 +825,7 @@ def run_trial(*,
         timespec='microseconds'
     )
     go_recv_perf_s = perf_counter_raw()
+    play_word(words, 'go')
     logger.log_gostop(
         trial_num=trial_num,
         marker_label=f"{mod_marker}_go_p0_t{trial_num}",
@@ -810,7 +833,6 @@ def run_trial(*,
         recv_perf_s=go_recv_perf_s,
         gostop_pause_s=pre_go_pause,
     )
-    play_word(words, 'go')
 
     # ── Run the 6 sub-blocks ─────────────────────────────────────────────
     n_pairs = len(template)
@@ -818,17 +840,40 @@ def run_trial(*,
     for position in range(6):
         subtype = subtype_by_position[position]
 
-        # Attention cue immediately before the regular block
+        # Attention instruction immediately before the regular block
         if subtype == 'reg':
             play_word(words, attend_word)
             time.sleep(0.5)
             if is_audio:
-                play_audio(_synth_tone(
-                    F_HIGH if attend_high else F_LOW, 0.5
-                ))
+                play_audio(stim_audio['attend_tone_high' if attend_high
+                                      else 'attend_tone_low'])
             else:
                 play_haptic_event(_drv, effect1 if attend_high else effect2)
             time.sleep(2)
+
+        # Rate-block instructions play BEFORE the volley/marker: stop.wav
+        # (logged as a 'gostop' row, appended after the play so the fsync
+        # never sits between timestamp capture and wav onset), a 3±1 s
+        # pause, then the ratesync prompt. Loaded WAVs are instructions,
+        # not cues — the block-5 marker/timestamps bracket only the rating
+        # collection.
+        if subtype == 'rate':
+            stop_recv_time_iso = datetime.now(timezone.utc).isoformat(
+                timespec='microseconds'
+            )
+            stop_recv_perf_s = perf_counter_raw()
+            post_stop_pause = 3.0 + random.uniform(-1, 1)
+            play_word(words, 'stop')
+            time.sleep(post_stop_pause)
+            logger.log_gostop(
+                trial_num=trial_num,
+                marker_label=f"{mod_marker}_stop_p5_t{trial_num}",
+                recv_time_iso=stop_recv_time_iso,
+                recv_perf_s=stop_recv_perf_s,
+                gostop_pause_s=post_stop_pause,
+            )
+            if not headless:
+                play_word(words, 'ratesync')
 
         marker = f"{mod_marker}_{subtype}_p{position}_t{trial_num}"
 
@@ -863,8 +908,9 @@ def run_trial(*,
         block_recv_perf_s = perf_counter_raw()
         send_marker_packet(marker)
 
-        # 3. Play the stimulus. For 'rate' the "stimulus" is the ratesync
-        #    prompt + rating collection (skipped in headless mode).
+        # 3. Play the stimulus. For 'rate' the "stimulus" is the rating
+        #    collection (skipped in headless mode); its instruction WAVs
+        #    already played before the volley.
         sync_rating = ''
         if subtype == 'sil':
             time.sleep(baseblocktime if position == 0 else cueblocktime)
@@ -879,27 +925,9 @@ def run_trial(*,
             else:
                 play_haptic_block(_drv, h_regular, cueblocktime)
         else:  # 'rate'
-            # Stop.wav plays first (so its onset is tied to the block-5
-            # marker), then a 3±1 s pause, then ratesync + rating. The
-            # pause value is generated once so the same number is both
-            # slept and logged in the 'gostop' row.
-            stop_recv_time_iso = datetime.now(timezone.utc).isoformat(
-                timespec='microseconds'
-            )
-            stop_recv_perf_s = perf_counter_raw()
-            post_stop_pause = 3.0 + random.uniform(-1, 1)
-            logger.log_gostop(
-                trial_num=trial_num,
-                marker_label=f"{mod_marker}_stop_p5_t{trial_num}",
-                recv_time_iso=stop_recv_time_iso,
-                recv_perf_s=stop_recv_perf_s,
-                gostop_pause_s=post_stop_pause,
-            )
-            play_word(words, 'stop')
-            time.sleep(post_stop_pause)
-            
+            # Instructions (stop / pause / ratesync) already played before
+            # the volley — the block window is just the rating collection.
             if not headless:
-                play_word(words, 'ratesync')
                 sync_rating = get_sync_rating()
 
         # 4. Log the block row. sync_rating is '' except for the rate block.
@@ -1139,14 +1167,28 @@ def main():
         print("  Loaded .wav files: " + ", ".join(loaded_names))
 
     # ── Summary ──────────────────────────────────────────────────────────
-    trial_dur   = baseblocktime + cueblocktime * 4
+    # Per-trial overhead beyond the stim blocks: preamble (ignore + nominal
+    # 3 s pause + go), attention sequence (word + 0.5 s + ~1 s cue + 2 s),
+    # rate-block instructions (stop + nominal 3 s pause + ratesync).
+    # Operator time (rating entry, between-trial continue) is not counted.
+    def _wav_s(name: str) -> float:
+        return len(words[name]) / SR if name in words else 0.0
+
+    attend_s = max(_wav_s(f'attend{leg}{sfx}')
+                   for sfx in ('high', 'low', 'click', 'buzz'))
+    trial_overhead = (
+        _wav_s('ignore') + 3.0 + _wav_s('go')
+        + attend_s + 0.5 + 1.0 + 2.0
+        + _wav_s('stop') + 3.0 + _wav_s('ratesync')
+    )
+    trial_dur   = baseblocktime + cueblocktime * 4 + trial_overhead
     est_minutes = total_trials * trial_dur / 60
 
     print(f"\n{'='*20}")
     print(f"  Participant   : {participant_id}")
     print(f"  Trials    : {total_trials}")
     print(f"  Regular period: {dur_s} s ± {dur_s_jitter} s ")
-    print(f"  Est. duration : ~{est_minutes:.1f} min")
+    print(f"  Est. duration : ~{est_minutes:.1f} min (+ operator time)")
     print(f"{'='*20}")
 
     # ── Pre-experiment ready cue ─────────────────────────────────────────
