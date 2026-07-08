@@ -273,7 +273,7 @@ TONE_DURATION = 0.15
 # Regular-cue period jitter — the delivered period is
 #   dur_s ± DUR_S_JITTER_DEFAULT  (seconds)
 # counter-balanced across trials (see build_trial_plan).
-DUR_S_JITTER_DEFAULT = 0.15
+DUR_S_JITTER_DEFAULT = 0.08
 
 # Templates
 NUM_TEMPLATES = 20
