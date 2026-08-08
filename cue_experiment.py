@@ -1135,11 +1135,15 @@ def main():
     )
 
     # Raw schedule strings, one line per factor:
-    # modality a/v, tempo +/-, attend h/l, focusleg l/r.
-    print(''.join(m[0] for m in modalities))
-    print(''.join('+' if t > 0 else '-' for t in tempos))
-    print(''.join(a[0] for a in attention_schedule))
-    print(''.join(lg[0] for lg in focus_legs))
+    # modality a/v, tempo +/-, attend h/l, focusleg l/r. Reprinted at each
+    # trial start with a ↓ over the current trial's column.
+    plan_lines = [
+        ''.join(m[0] for m in modalities),
+        ''.join('+' if t > 0 else '-' for t in tempos),
+        ''.join(a[0] for a in attention_schedule),
+        ''.join(lg[0] for lg in focus_legs),
+    ]
+    print('\n'.join(plan_lines))
 
     total_trials = len(modalities)
     if args.headless:
@@ -1223,11 +1227,8 @@ def main():
             dur_delivered  = dur_high if tempo > 0 else dur_low
 
             print(f"\n{'─'*20}")
-            print(f"T#{trial_num}/{total_trials}  "
-                  f"[{modality.upper()}] "
-                  f"dur={dur_delivered:.3f}s ({'+' if tempo > 0 else '-'})  "
-                  f"attn={attend}  "
-                  f"leg={leg}")
+            print(' ' * idx + '↓')
+            print('\n'.join(plan_lines))
             print(f"{'─'*20}")
 
             t0 = perf_counter_raw()
