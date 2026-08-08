@@ -11,19 +11,17 @@ Hardware
 
 Operator console
 ----------------
-  All operator I/O (subject ID, focus leg, resume prompt, ready-cue
+  All operator I/O (subject ID, loop direction, resume prompt, ready-cue
   confirmation, between-trial continue, sync rating) goes through the
   controlling terminal (PiTFT). An RF-dongle USB keyboard plugs into Pi.
 
 Pre-experiment
 --------------
-  After subject ID + focus leg ('left'/'right') are entered, one
+  After subject ID + loop direction ('cw'/'ccw') are entered, the matching
   'ready{cw,ccw}.wav' cue plays and the operator confirms with 'y' before
-  trial 1. Rotation direction is counter-balanced against PID parity:
-      odd  PID + left → readyccw    odd  PID + right → readycw
-      even PID + left → readycw     even PID + right → readyccw
-  The focused leg is appended to the CSV log filename
-  (cue_log_pid-{pid}_focusleg-{leg}_{ts}.csv).
+  trial 1. Loop direction is entered by the operator (counter-balance it
+  across subjects when assigning sessions). The loop direction is appended
+  to the CSV log filename (cue_log_pid-{pid}_loop-{dir}_{ts}.csv).
 
 Trial structure (1 baseline silent + 4 cue sub-blocks + 1 rate sub-block)
 -------------------------------------------------------------------------
@@ -36,15 +34,18 @@ Trial structure (1 baseline silent + 4 cue sub-blocks + 1 rate sub-block)
   --cueblocktime seconds long. The rate block runs as long as it takes
   the operator to type the rating.
 
-  The delivered regular-cue period is counter-balanced per modality between
-  dur_s-dur_s_jitter and dur_s+dur_s_jitter. With the
-  defaults (--blocknum 8, --dur-s 1.2, --dur-s-jitter 0.15) that is
-  8 trials at 1.05 s and 8 trials at 1.35 s across modality, with a
-  balanced attend-high / attend-low split.
+  Each trial's condition comes from a balanced pseudorandomized schedule
+  over the 16 cells of modality × tempo × attend × focusleg
+  (build_trial_plan). The delivered regular-cue period is
+  dur_s-dur_s_jitter or dur_s+dur_s_jitter. With the defaults
+  (--blocknum 16, --dur-s 1.2, --dur-s-jitter 0.15) that is 16 trials
+  covering each cell exactly once: 8 at 1.05 s / 8 at 1.35 s, split
+  evenly across modality, attend-high/low, and left/right focus leg.
 
   The attention cue ('attend{leg}high'/'attend{leg}low' or
   'attend{leg}click'/'attend{leg}buzz') always plays immediately before
-  the regular block, where {leg} is the per-session focused leg.
+  the regular block, where {leg} is the trial's focused leg from the
+  counterbalanced schedule.
 
   In the rate sub-block 'stop.wav' plays (logged as a 'gostop' row), then
   a 3±1 s pause, then 'ratesync.wav' — all BEFORE the block's ping volley
@@ -555,7 +556,10 @@ class ExperimentLogger:
     Columns with limited scope are left blank when not applicable:
       - template_index    : only for arrhythmic blocks
       - dur_s             : only for regular blocks (delivered cycle period, s)
-      - dur_jitter_sign   : only for regular blocks (+1 / -1)
+      - tempo             : only for regular blocks (+1 = dur_s+jitter slower,
+                            -1 = dur_s-jitter faster)
+      - attend            : only for regular blocks ('high' / 'low')
+      - focusleg          : only for regular blocks (trial's focused leg)
       - sync_rating       : only for the rate block of each trial
 
     marker_label encodes modality / block_subtype / block_position / trial_num
@@ -592,8 +596,9 @@ class ExperimentLogger:
         'recv_perf_s',
         'template_index',
         'dur_s',
-        'dur_jitter_sign',
-        'attend_high',
+        'tempo',
+        'attend',
+        'focusleg',
         'sync_rating',
         'marker_label',
         'rtt1_ms',
@@ -604,11 +609,11 @@ class ExperimentLogger:
     ]
 
     def __init__(self, participant_id: str, output_dir: str = 'log',
-                 focus_leg: str | None = None):
+                 loop_dir: str | None = None):
         self.pid = participant_id
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         os.makedirs(output_dir, exist_ok=True)
-        suffix = f"focusleg-{focus_leg}_" if focus_leg else ''
+        suffix = f"loop-{loop_dir}_" if loop_dir else ''
         self.filename = os.path.join(
             output_dir, f"cue_log_pid-{participant_id}_{suffix}{ts}.csv"
         )
@@ -625,10 +630,11 @@ class ExperimentLogger:
             os.fsync(f.fileno())
 
     def log_block(self, *, trial_num: int, marker_label: str,
-                  attend_high: bool,
+                  attend: str = '',
+                  focusleg: str = '',
                   template_index: int | str = '',
                   dur_s: float | str = '',
-                  dur_jitter_sign: int | str = '',
+                  tempo: int | str = '',
                   sync_rating: int | str = '',
                   recv_time_iso: str | None = None,
                   recv_perf_s: float | None = None):
@@ -646,8 +652,9 @@ class ExperimentLogger:
             f"{recv_perf_s:.6f}",
             template_index,
             dur_s,
-            dur_jitter_sign,
-            attend_high,
+            tempo,
+            attend,
+            focusleg,
             sync_rating,
             marker_label,
             '', '', '', '',   # rtt1_ms, rtt2_ms, rtt3_ms, rtt_additional
@@ -673,7 +680,7 @@ class ExperimentLogger:
             trial_num,
             recv_time_iso,
             f"{recv_perf_s:.6f}",
-            '', '', '', '', '',  # template_index, dur_s, dur_jitter_sign, attend_high, sync_rating
+            '', '', '', '', '', '',  # template_index, dur_s, tempo, attend, focusleg, sync_rating
             marker_label,
             r1, r2, r3, r_add,
             '',                  # gostop_pause_s
@@ -697,7 +704,7 @@ class ExperimentLogger:
             trial_num,
             recv_time_iso,
             f"{recv_perf_s:.6f}",
-            '', '', '', '', '',  # template_index, dur_s, dur_jitter_sign, attend_high, sync_rating
+            '', '', '', '', '', '',  # template_index, dur_s, tempo, attend, focusleg, sync_rating
             marker_label,
             '', '', '', '',      # rtt1_ms, rtt2_ms, rtt3_ms, rtt_additional
             f"{gostop_pause_s:.6f}",
@@ -755,10 +762,10 @@ def run_trial(*,
               baseblocktime: float,
               cueblocktime: float,
               dur_s: float,
-              dur_jitter_sign: int,
+              tempo: int,
               template: list,
               template_index: int,
-              attend_high: bool,
+              attend: str,
               leg: str,
               stim_audio: dict,
               stim_haptic: dict,
@@ -788,7 +795,7 @@ def run_trial(*,
     """
     is_audio   = (modality == 'audio')
     mod_marker = 'a' if is_audio else 'v'
-    dur_key    = 'regular_high' if dur_jitter_sign > 0 else 'regular_low'
+    dur_key    = 'regular_high' if tempo > 0 else 'regular_low'
 
     # ── Pick stimuli ─────────────────────────────────────────────────────
     if is_audio:
@@ -809,9 +816,9 @@ def run_trial(*,
                            3: 'reg', 4: 'sil', 5: 'rate'}
 
     if is_audio:
-        attend_word = f'attend{leg}high'  if attend_high else f'attend{leg}low'
+        attend_word = f'attend{leg}high'  if attend == 'high' else f'attend{leg}low'
     else:
-        attend_word = f'attend{leg}click' if attend_high else f'attend{leg}buzz'
+        attend_word = f'attend{leg}click' if attend == 'high' else f'attend{leg}buzz'
 
     # ── Preamble ─────────────────────────────────────────────────────────
     # Pre-go pause is generated once so the same value can be both slept and
@@ -845,10 +852,10 @@ def run_trial(*,
             play_word(words, attend_word)
             time.sleep(0.5)
             if is_audio:
-                play_audio(stim_audio['attend_tone_high' if attend_high
+                play_audio(stim_audio['attend_tone_high' if attend == 'high'
                                       else 'attend_tone_low'])
             else:
-                play_haptic_event(_drv, effect1 if attend_high else effect2)
+                play_haptic_event(_drv, effect1 if attend == 'high' else effect2)
             time.sleep(2)
 
         # Rate-block instructions play BEFORE the volley/marker: stop.wav
@@ -879,19 +886,21 @@ def run_trial(*,
 
         # Per-block metadata for the logger
         if subtype == 'sil':
-            tpl_log = dur_log = dur_sign_log = ''
+            tpl_log = dur_log = tempo_log = attend_log = leg_log = ''
             desc = 'silent'
         elif subtype == 'arr':
             tpl_log = template_index
-            dur_log = dur_sign_log = ''
+            dur_log = tempo_log = attend_log = leg_log = ''
             desc = f"arrhythmic ({n_pairs} pairs)"
         elif subtype == 'reg':
             tpl_log = ''
             dur_log = f"{dur_s:.6f}"
-            dur_sign_log = dur_jitter_sign
+            tempo_log = tempo
+            attend_log = attend
+            leg_log = leg
             desc = f"regular {dur_s:.3f}s"
         else:  # 'rate'
-            tpl_log = dur_log = dur_sign_log = ''
+            tpl_log = dur_log = tempo_log = attend_log = leg_log = ''
             desc = 'rate'
 
         print(f"    Block {position}: {desc}")
@@ -934,10 +943,11 @@ def run_trial(*,
         logger.log_block(
             trial_num=trial_num,
             marker_label=marker,
-            attend_high=attend_high,
+            attend=attend_log,
+            focusleg=leg_log,
             template_index=tpl_log,
             dur_s=dur_log,
-            dur_jitter_sign=dur_sign_log,
+            tempo=tempo_log,
             sync_rating=sync_rating,
             recv_time_iso=block_recv_time_iso,
             recv_perf_s=block_recv_perf_s,
@@ -955,30 +965,17 @@ def get_participant_id() -> str:
     return input("Enter participant ID: ").strip()
 
 
-def get_focus_leg() -> str:
-    """Prompt for the per-session focused leg ('left' or 'right')."""
+def get_loop_dir() -> str:
+    """Prompt for the session loop direction ('cw' or 'ccw'), used for the
+    pre-trial ready cue and the log filename. Counter-balance it across
+    subjects when assigning sessions."""
     while True:
         try:
-            v = input("Focus leg (left/right): ").strip().lower()
+            v = input("Loop direction (cw/ccw): ").strip().lower()
         except EOFError:
-            return 'left'
-        if v in ('left', 'l'):
-            return 'left'
-        if v in ('right', 'r'):
-            return 'right'
-
-
-def _ready_direction(pid: str, leg: str) -> str:
-    """Return 'cw' or 'ccw' for the pre-trial ready cue.
-
-    Counterbalances rotation direction across subjects:
-      odd  PID + left  → ccw    odd  PID + right → cw
-      even PID + left  → cw     even PID + right → ccw
-    Non-numeric `pid` (e.g. 'headless') is treated as even.
-    """
-    digits = ''.join(c for c in pid if c.isdigit())
-    pid_odd = bool(int(digits) % 2) if digits else False
-    return 'ccw' if (pid_odd == (leg == 'left')) else 'cw'
+            return 'cw'
+        if v in ('cw', 'ccw'):
+            return v
 
 
 def wait_for_continue() -> bool:
@@ -1009,7 +1006,7 @@ def get_resume_start_index(total_trials: int) -> int:
     """Prompt resume position and return 0-based trial index to start from.
 
     With the always-randomized schedule the run is a single interleaved
-    sequence (no a/b blocks), and the (pid, leg) seed in build_trial_plan
+    sequence (no a/b blocks), and the pid seed in build_trial_plan
     makes 'trial N' the same trial every restart.
     """
     ans = input("Resume previous session? (1/0): ").strip()
@@ -1026,31 +1023,33 @@ def get_resume_start_index(total_trials: int) -> int:
 
 def build_trial_plan(blocknum: int,
                      participant_id: str,
-                     leg: str,
-                     ) -> tuple[list[str], list[bool], list[int]]:
+                     ) -> tuple[list[str], list[int], list[str], list[str]]:
     """Build a balanced, randomized per-trial schedule.
 
-    Returns (modalities, attend_high, dur_signs).
+    Returns (modalities, tempos, attends, focus_legs).
 
-    The schedule is deterministic in (participant_id, leg): restarting with
-    the same PID + leg reproduces the exact same trial sequence, so
-    resume-from-trial-N is well-defined even though modalities/dur/attend
-    are interleaved.
+    The schedule is deterministic in participant_id: restarting with the
+    same PID reproduces the exact same trial sequence, so
+    resume-from-trial-N is well-defined even though
+    modality/tempo/attend/leg are interleaved.
 
-    Total = 2 * blocknum trials, balanced across the 8 cells of
-    (modality × dur_sign × attend_high). Block order is fixed
+    Total = blocknum trials, balanced across the 16 cells of
+    (modality × tempo × attend × focusleg). tempo is the regular-cue
+    period condition: +1 → dur_s+jitter (longer period, slower), -1 →
+    dur_s-jitter (shorter period, faster). Block order is fixed
     (arrhythmic always first) so it is not part of the schedule.
-    Any remainder when total is not a multiple of 8 is padded with
-    random cells from the same (pid, leg) stream.
+    Any remainder when total is not a multiple of 16 is padded with
+    random cells from the same pid stream.
     """
-    rng = random.Random(f"participant::{participant_id}::leg::{leg}")
+    rng = random.Random(f"participant::{participant_id}")
 
-    total = 2 * blocknum
-    cells = [(m, s, a) for m in ('audio', 'vibration')
-                       for s in (+1, -1)
-                       for a in (True, False)]
+    total = blocknum
+    cells = [(m, t, a, l) for m in ('audio', 'vibration')
+                          for t in (+1, -1)
+                          for a in ('high', 'low')
+                          for l in ('left', 'right')]
     per_cell = total // len(cells)
-    conditions: list[tuple[str, int, bool]] = []
+    conditions: list[tuple[str, int, str, str]] = []
     for cell in cells:
         conditions.extend([cell] * per_cell)
     for _ in range(total - len(conditions)):
@@ -1058,10 +1057,11 @@ def build_trial_plan(blocknum: int,
     rng.shuffle(conditions)
 
     modalities = [c[0] for c in conditions]
-    signs      = [c[1] for c in conditions]
+    tempos     = [c[1] for c in conditions]
     attend     = [c[2] for c in conditions]
+    legs       = [c[3] for c in conditions]
 
-    return modalities, attend, signs
+    return modalities, tempos, attend, legs
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1079,16 +1079,14 @@ def main():
         print(sd.query_devices())
         return
 
-    # ── Participant ID + focus leg ───────────────────────────────────────
+    # ── Participant ID + loop direction ──────────────────────────────────
     if args.headless:
         participant_id = f"headless"
-        leg            = 'left'
+        loop_dir       = 'cw'
     else:
         participant_id = get_participant_id()
-        leg            = get_focus_leg()
-    ready_dir = _ready_direction(participant_id, leg)
-    print(f"\nParticipant: {participant_id}  "
-          f"(focus leg: {leg}, ready: {ready_dir})")
+        loop_dir       = get_loop_dir()
+    print(f"\nParticipant: {participant_id}  (loop: {loop_dir})")
 
     # ── Parameters ───────────────────────────────────────────────────────
     blocknum          = args.blocknum
@@ -1132,9 +1130,16 @@ def main():
           f"(regular periods: {dur_low:.3f} / {dur_high:.3f} s)")
 
     # ── Build per-trial schedules ────────────────────────────────────────
-    modalities, attention_schedule, dur_signs = (
-        build_trial_plan(blocknum, participant_id, leg)
+    modalities, tempos, attention_schedule, focus_legs = (
+        build_trial_plan(blocknum, participant_id)
     )
+
+    # Raw schedule strings, one line per factor:
+    # modality a/v, tempo +/-, attend h/l, focusleg l/r.
+    print(''.join(m[0] for m in modalities))
+    print(''.join('+' if t > 0 else '-' for t in tempos))
+    print(''.join(a[0] for a in attention_schedule))
+    print(''.join(lg[0] for lg in focus_legs))
 
     total_trials = len(modalities)
     if args.headless:
@@ -1145,15 +1150,17 @@ def main():
             print(f"Resuming from trial {start_idx + 1}/{total_trials}")
 
     # ── Logger ───────────────────────────────────────────────────────────
-    logger = ExperimentLogger(participant_id, focus_leg=leg)
+    logger = ExperimentLogger(participant_id, loop_dir=loop_dir)
     marker_init(logger_ip, logger=logger)
 
     # ── Pre-load WAV cues ────────────────────────────────────────────────
     words = {}
     loaded_names = []
     for name in ['ignore', 'go', 'stop',
-                 f'attend{leg}high',  f'attend{leg}low',
-                 f'attend{leg}click', f'attend{leg}buzz',
+                 'attendlefthigh',   'attendleftlow',
+                 'attendleftclick',  'attendleftbuzz',
+                 'attendrighthigh',  'attendrightlow',
+                 'attendrightclick', 'attendrightbuzz',
                  'ratesync', 'readyccw', 'readycw']:
         try:
             words[name] = load_wav(f'{name}.wav')
@@ -1174,7 +1181,8 @@ def main():
     def _wav_s(name: str) -> float:
         return len(words[name]) / SR if name in words else 0.0
 
-    attend_s = max(_wav_s(f'attend{leg}{sfx}')
+    attend_s = max(_wav_s(f'attend{lg}{sfx}')
+                   for lg in ('left', 'right')
                    for sfx in ('high', 'low', 'click', 'buzz'))
     trial_overhead = (
         _wav_s('ignore') + 3.0 + _wav_s('go')
@@ -1192,7 +1200,7 @@ def main():
     print(f"{'='*20}")
 
     # ── Pre-experiment ready cue ─────────────────────────────────────────
-    ready_word = f'ready{ready_dir}'
+    ready_word = f'ready{loop_dir}'
     print(f"  Ready cue         : {ready_word}")
     if not args.headless:
         play_word(words, ready_word)
@@ -1209,15 +1217,17 @@ def main():
             tpl_idx        = idx % NUM_TEMPLATES
             template       = templates[tpl_idx]
             trial_num      = idx + 1
-            dur_sign       = dur_signs[idx]
-            attend_high    = attention_schedule[idx]
-            dur_delivered  = dur_high if dur_sign > 0 else dur_low
+            tempo          = tempos[idx]
+            attend         = attention_schedule[idx]
+            leg            = focus_legs[idx]
+            dur_delivered  = dur_high if tempo > 0 else dur_low
 
             print(f"\n{'─'*20}")
             print(f"T#{trial_num}/{total_trials}  "
                   f"[{modality.upper()}] "
-                  f"dur={dur_delivered:.3f}s ({'+' if dur_sign > 0 else '-'})  "
-                  f"attn={'high' if attend_high else 'low'}")
+                  f"dur={dur_delivered:.3f}s ({'+' if tempo > 0 else '-'})  "
+                  f"attn={attend}  "
+                  f"leg={leg}")
             print(f"{'─'*20}")
 
             t0 = perf_counter_raw()
@@ -1228,10 +1238,10 @@ def main():
                     baseblocktime=baseblocktime,
                     cueblocktime=cueblocktime,
                     dur_s=dur_delivered,
-                    dur_jitter_sign=dur_sign,
+                    tempo=tempo,
                     template=template,
                     template_index=tpl_idx,
-                    attend_high=attend_high,
+                    attend=attend,
                     leg=leg,
                     stim_audio=stim_audio,
                     stim_haptic=stim_haptic,
@@ -1272,9 +1282,10 @@ def parse_args():
         description="Rhythmic cueing experiment",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument('--blocknum',    type=int,   default=8,
-                   help="Trials per modality (total = 2 × blocknum, balanced-"
-                        "randomized across modality × dur_sign × attend_high)")
+    p.add_argument('--blocknum',    type=int,   default=16,
+                   help="Total number of trials (balanced-randomized across "
+                        "modality × tempo × attend × focusleg; full "
+                        "balance needs a multiple of 16)")
     p.add_argument('--baseblocktime', type=float, default=10,
                    help="Duration of the baseline silent block at position 0 (s)")
     p.add_argument('--cueblocktime',  type=float, default=20,
