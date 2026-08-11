@@ -1,0 +1,1 @@
+event_type,participant_id,trial_num,recv_time_iso,recv_perf_s,modality,block_position,block_subtype,block_order,template_index,freq_hz,freq_jitter_sign,attend_high,sync_rating,marker_label,rtt1_ms,rtt2_ms,rtt3_ms

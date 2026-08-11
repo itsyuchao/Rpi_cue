@@ -1,0 +1,2 @@
+event_type,participant_id,trial_num,recv_time_iso,recv_perf_s,template_index,dur_s,tempo,attend,focusleg,sync_rating,marker_label,rtt1_ms,rtt2_ms,rtt3_ms,rtt_additional,gostop_pause_s
+gostop,00,5,2026-08-11T21:46:35.393123+00:00,3187.337682,,,,,,,v_go_p0_t5,,,,,3.029533

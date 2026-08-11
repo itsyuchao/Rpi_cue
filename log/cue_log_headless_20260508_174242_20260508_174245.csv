@@ -1,0 +1,11 @@
+event_type,participant_id,trial_num,recv_time_iso,recv_perf_s,modality,block_position,block_subtype,block_order,template_index,freq_hz,freq_jitter_sign,attend_high,sync_rating,marker_label,rtt1_ms,rtt2_ms,rtt3_ms
+ping,headless_20260508_174242,1,2026-05-08T21:42:54.240007+00:00,21553.695930,,,,,,,,,,a_sil_p0_t1,98.351,5.112,3.962
+block,headless_20260508_174242,1,2026-05-08T21:42:54.368333+00:00,21553.824258,audio,0,silent,arr_first,,,,True,,,,,
+ping,headless_20260508_174242,1,2026-05-08T21:43:04.449419+00:00,21563.905339,,,,,,,,,,a_arr_p1_t1,26.878,3.586,3.897
+block,headless_20260508_174242,1,2026-05-08T21:43:04.497698+00:00,21563.953628,audio,1,arrhythmic,arr_first,0,,,True,,,,,
+ping,headless_20260508_174242,1,2026-05-08T21:43:14.578157+00:00,21574.034109,,,,,,,,,,a_sil_p2_t1,10.487,3.467,3.901
+block,headless_20260508_174242,1,2026-05-08T21:43:14.610422+00:00,21574.066354,audio,2,silent,arr_first,,,,True,,,,,
+ping,headless_20260508_174242,1,2026-05-08T21:43:30.546876+00:00,21590.002809,,,,,,,,,,a_reg_p3_t1,42.926,6.116,4.325
+block,headless_20260508_174242,1,2026-05-08T21:43:30.621257+00:00,21590.077194,audio,3,regular,arr_first,,1.100000,1,True,,,,,
+ping,headless_20260508_174242,1,2026-05-08T21:43:40.703545+00:00,21600.159468,,,,,,,,,,a_sil_p4_t1,17.517,3.615,3.866
+block,headless_20260508_174242,1,2026-05-08T21:43:40.749101+00:00,21600.205029,audio,4,silent,arr_first,,,,True,,,,,

@@ -1,0 +1,7 @@
+event_type,participant_id,trial_num,recv_time_iso,recv_perf_s,modality,block_position,block_subtype,block_order,template_index,freq_hz,freq_jitter_sign,attend_high,sync_rating,marker_label,rtt1_ms,rtt2_ms,rtt3_ms
+ping,00,1,2026-05-11T23:39:32.825398+00:00,24775.965070,,,,,,,,,,a_sil_p0_t1,timeout,timeout,timeout
+block,00,1,2026-05-11T23:39:34.347983+00:00,24777.487678,audio,0,silent,arr_first,,,,False,,,,,
+ping,00,1,2026-05-11T23:39:54.425664+00:00,24797.565409,,,,,,,,,,a_arr_p1_t1,timeout,timeout,timeout
+block,00,1,2026-05-11T23:39:55.941708+00:00,24799.081477,audio,1,arrhythmic,arr_first,0,,,False,,,,,
+ping,00,1,2026-05-11T23:40:16.030500+00:00,24819.170324,,,,,,,,,,a_sil_p2_t1,timeout,timeout,timeout
+block,00,1,2026-05-11T23:40:17.553372+00:00,24820.693218,audio,2,silent,arr_first,,,,False,,,,,

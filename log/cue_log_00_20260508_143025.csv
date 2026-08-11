@@ -1,0 +1,10 @@
+event_type,participant_id,trial_num,recv_time_iso,recv_perf_s,modality,block_position,block_subtype,block_order,template_index,freq_hz,freq_jitter_sign,attend_high,sync_rating,marker_label,rtt1_ms,rtt2_ms,rtt3_ms
+ping,00,3,2026-05-08T18:30:35.283773+00:00,10014.739690,,,,,,,,,,a_sil_p0_t3,5.468,3.659,3.875
+block,00,3,2026-05-08T18:30:35.304464+00:00,10014.760391,audio,0,silent,arr_first,,,,False,,,,,
+ping,00,3,2026-05-08T18:30:50.384556+00:00,10029.840485,,,,,,,,,,a_arr_p1_t3,51.072,6.791,3.825
+block,00,3,2026-05-08T18:30:50.456693+00:00,10029.912629,audio,1,arrhythmic,arr_first,2,,,False,,,,,
+ping,00,3,2026-05-08T18:31:05.535527+00:00,10044.991450,,,,,,,,,,a_sil_p2_t3,55.663,4.529,3.872
+block,00,3,2026-05-08T18:31:05.606999+00:00,10045.062928,audio,2,silent,arr_first,,,,False,,,,,
+ping,00,3,2026-05-08T18:31:26.603011+00:00,10066.058951,,,,,,,,,,a_reg_p3_t3,78.688,3.398,3.832
+block,00,3,2026-05-08T18:31:26.696290+00:00,10066.152212,audio,3,regular,arr_first,,1.100000,1,False,,,,,
+ping,00,3,2026-05-08T18:31:41.774862+00:00,10081.230782,,,,,,,,,,a_sil_p4_t3,57.886,3.739,3.902

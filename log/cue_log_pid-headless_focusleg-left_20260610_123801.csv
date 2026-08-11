@@ -1,0 +1,13 @@
+event_type,participant_id,trial_num,recv_time_iso,recv_perf_s,template_index,dur_s,dur_jitter_sign,attend_high,sync_rating,marker_label,rtt1_ms,rtt2_ms,rtt3_ms,rtt_additional,gostop_pause_s
+gostop,headless,1,2026-06-10T16:38:14.780107+00:00,3490.251914,,,,,,a_go_p0_t1,,,,,2.422367
+ping,headless,1,2026-06-10T16:38:15.625490+00:00,3491.097254,,,,,,a_sil_p0_t1,16.130,3.659,3.821,,
+block,headless,1,2026-06-10T16:38:15.663256+00:00,3491.135032,,,,True,,a_sil_p0_t1,,,,,
+ping,headless,1,2026-06-10T16:38:25.691749+00:00,3501.163599,,,,,,a_arr_p1_t1,8.525,3.280,3.913,,
+block,headless,1,2026-06-10T16:38:25.721397+00:00,3501.193247,0,,,True,,a_arr_p1_t1,,,,,
+ping,headless,1,2026-06-10T16:38:45.813181+00:00,3521.285161,,,,,,a_sil_p2_t1,13.622,3.329,3.827,,
+block,headless,1,2026-06-10T16:38:45.847780+00:00,3521.319755,,,,True,,a_sil_p2_t1,,,,,
+ping,headless,1,2026-06-10T16:39:13.062097+00:00,3548.534323,,,,,,a_reg_p3_t1,8.432,3.161,3.875,,
+block,headless,1,2026-06-10T16:39:13.091876+00:00,3548.564033,,1.350000,1,True,,a_reg_p3_t1,,,,,
+ping,headless,1,2026-06-10T16:39:33.177571+00:00,3568.649844,,,,,,a_sil_p4_t1,7.418,3.549,3.557,,
+block,headless,1,2026-06-10T16:39:33.205941+00:00,3568.678223,,,,True,,a_sil_p4_t1,,,,,
+ping,headless,1,2026-06-10T16:39:53.227651+00:00,3588.700062,,,,,,a_rate_p5_t1,7.759,3.359,3.687,,
