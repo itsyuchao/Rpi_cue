@@ -116,10 +116,6 @@ _ping_nonce: int = 0
 _logger = None  # ExperimentLogger, set by marker_init
 
 
-# trial_dict = {0: "high", 1: "low", 2: "click", 3: "buzz"}
-# trial_order = [0, 1, 2, 3, 1, 3, 0, 2, 2, 0, 3, 1, 2, 3, 0, 1, 3, 2, 1, 0]
-
-
 def perf_counter_raw() -> float:
     """Monotonic seconds from the SoC oscillator, NOT NTP-slewed.
 
