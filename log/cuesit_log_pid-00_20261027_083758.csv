@@ -1,0 +1,8 @@
+event_type,participant_id,trial_num,recv_time_iso,recv_perf_s,dur_s,tempo,target,count,marker_label,rtt1_ms,rtt2_ms,rtt3_ms,rtt_additional
+ping,00,1,2026-10-27T12:38:13.333176+00:00,44154.985877,,,,,a_reg_p0_t1,timeout,timeout,timeout,timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout
+block,00,1,2026-10-27T12:38:19.857949+00:00,44161.510694,1.080000,1,low,,a_reg_p0_t1,,,,
+ping,00,1,2026-10-27T12:38:49.929336+00:00,44191.582335,,,,,a_sil_p1_t1,timeout,timeout,timeout,timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout
+block,00,1,2026-10-27T12:38:56.448800+00:00,44198.101846,,,,,a_sil_p1_t1,,,,
+ping,00,1,2026-10-27T12:39:01.454608+00:00,44203.107690,,,,,a_cnt_p2_t1,timeout,timeout,timeout,timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout
+block,00,1,2026-10-27T12:39:07.974134+00:00,44209.627297,,,,26,a_cnt_p2_t1,,,,
+ping,00,2,2026-10-27T12:39:21.582715+00:00,44223.235967,,,,,a_reg_p0_t2,timeout,timeout,timeout,timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout

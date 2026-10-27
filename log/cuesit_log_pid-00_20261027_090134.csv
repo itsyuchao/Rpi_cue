@@ -1,0 +1,2 @@
+event_type,participant_id,trial_num,recv_time_iso,recv_perf_s,dur_s,tempo,target,count,marker_label,rtt1_ms,rtt2_ms,rtt3_ms,rtt_additional
+ping,00,1,2026-10-27T13:01:50.602785+00:00,45572.267055,,,,,a_reg_p0_t1,7.897,2.011,1.471,
