@@ -1,0 +1,7 @@
+event_type,participant_id,trial_num,recv_time_iso,recv_perf_s,template_index,dur_s,tempo,attend,focusleg,sync_rating,marker_label,rtt1_ms,rtt2_ms,rtt3_ms,rtt_additional,gostop_pause_s
+gostop,00,1,2026-10-26T23:25:21.248876+00:00,21819.887173,,,,,,,a_go_p0_t1,,,,,2.981450
+ping,00,1,2026-10-26T23:25:22.102526+00:00,21820.740787,,,,,,,a_sil_p0_t1,timeout,timeout,timeout,timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout,
+block,00,1,2026-10-26T23:25:28.656069+00:00,21827.294396,,,,,,,a_sil_p0_t1,,,,,
+ping,00,1,2026-10-26T23:25:45.784264+00:00,21844.422734,,,,,,,a_reg_p1_t1,timeout,timeout,timeout,timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout,
+block,00,1,2026-10-26T23:25:52.325098+00:00,21850.963622,,1.120000,-1,low,right,,a_reg_p1_t1,,,,,
+ping,00,1,2026-10-26T23:26:12.398421+00:00,21871.037083,,,,,,,a_sil_p2_t1,timeout,timeout,timeout,timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout/timeout,
