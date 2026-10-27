@@ -38,8 +38,8 @@ Trial structure (1 baseline silent + 4 cue sub-blocks + 1 rate sub-block)
   over the 16 cells of modality × tempo × attend × focusleg
   (build_trial_plan). The delivered regular-cue period is
   dur_s-dur_s_jitter or dur_s+dur_s_jitter. With the defaults
-  (--blocknum 16, --dur-s 1.2, --dur-s-jitter 0.15) that is 16 trials
-  covering each cell exactly once: 8 at 1.05 s / 8 at 1.35 s, split
+  (--blocknum 16, --dur-s 1.0, --dur-s-jitter 0.08) that is 16 trials
+  covering each cell exactly once: 8 at 0.92 s / 8 at 1.08 s, split
   evenly across modality, attend-high/low, and left/right focus leg.
 
   The attention cue ('attend{leg}high'/'attend{leg}low' or
@@ -70,7 +70,8 @@ Per-block network protocol
   stimulation (or rating) window. All waveforms are pre-padded with 50 ms
   of startup silence at build/load time; audio onsets therefore lag the
   block timestamp by that fixed 50 ms plus device latency
-  (sd.default.latency = 'low').
+  (sounddevice default; sd.default.latency = 'low' is commented out
+  in audio_init).
 
   Putting the volley before the marker emit gives the marker packet the
   lowest-latency, highest-reliability slot in the sequence. Column names
@@ -1289,7 +1290,7 @@ def parse_args():
                    help="Duration of each cue / post-cue silent sub-block "
                         "at positions 1-4 (s). Arrhythmic templates must be "
                         "generated for this duration.")
-    p.add_argument('--dur-s',       type=float, default=1.2,
+    p.add_argument('--dur-s',       type=float, default=1.0,
                    help="Nominal regular-cue cycle period (s). Delivered "
                         "period is counter-balanced to dur_s ± dur_s_jitter.")
     p.add_argument('--dur-s-jitter', type=float,

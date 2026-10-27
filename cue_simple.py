@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-cue_experiment.py
-=================
+cue_simple.py
+=============
 Rhythmic cueing experiment controller for Raspberry Pi 3.
 
 Hardware
@@ -25,7 +25,7 @@ Pre-experiment
 
 Trial structure (1 baseline silent + 2 cue sub-blocks + 1 rate sub-block)
 -------------------------------------------------------------------------
-  'ignore.wav' → pause → 'go.wav' → 3 stim blocks → rate block
+  'ignore_simple.wav' → pause → 'go.wav' → 3 stim blocks → rate block
 
     silent(base) → regular → silent → rate
 
@@ -37,8 +37,8 @@ Trial structure (1 baseline silent + 2 cue sub-blocks + 1 rate sub-block)
   over the 16 cells of modality × tempo × attend × focusleg
   (build_trial_plan). The delivered regular-cue period is
   dur_s-dur_s_jitter or dur_s+dur_s_jitter. With the defaults
-  (--blocknum 16, --dur-s 1.2, --dur-s-jitter 0.15) that is 16 trials
-  covering each cell exactly once: 8 at 1.05 s / 8 at 1.35 s, split
+  (--blocknum 16, --dur-s 1.0, --dur-s-jitter 0.08) that is 16 trials
+  covering each cell exactly once: 8 at 0.92 s / 8 at 1.08 s, split
   evenly across modality, attend-high/low, and left/right focus leg.
 
   The attention cue ('attend{leg}high'/'attend{leg}low' or
@@ -64,12 +64,13 @@ Per-block network protocol
        UDP packet on the now-warm path.
     3. Begin stimulation.
 
-  Instruction WAVs (ignore/go/attend*/stop/ratesync) always play before
+  Instruction WAVs (ignore_simple/go/attend*/stop/ratesync) always play before
   step 1, so the marker and block timestamps bracket only the actual
   stimulation (or rating) window. All waveforms are pre-padded with 50 ms
   of startup silence at build/load time; audio onsets therefore lag the
   block timestamp by that fixed 50 ms plus device latency
-  (sd.default.latency = 'low').
+  (sounddevice default; sd.default.latency = 'low' is commented out
+  in audio_init).
 
   Putting the volley before the marker emit gives the marker packet the
   lowest-latency, highest-reliability slot in the sequence. Column names
@@ -589,7 +590,7 @@ class ExperimentLogger:
                    gostop_pause_s: float):
         """Append one 'gostop' row marking the go.wav / stop.wav play moment.
 
-        Logged for block 0 (go.wav, with the pre-go pause) and block 5
+        Logged for block 0 (go.wav, with the pre-go pause) and block 3
         (stop.wav, with the post-stop pause before ratesync). recv_time_iso /
         recv_perf_s are captured immediately before the play call; the row
         itself is appended after playback so the CSV fsync never sits
@@ -662,7 +663,7 @@ def run_trial(*,
               headless: bool = False):
     """Run one trial for either modality.
 
-    Preamble : 'ignore' → pause → 'go'
+    Preamble : 'ignore_simple' → pause → 'go'
     Blocks   : 4 sub-blocks, fixed layout:
                  p0=silent (baseblocktime), p1=regular (cueblocktime),
                  p2=silent (cueblocktime),  p3=rate.
@@ -707,7 +708,7 @@ def run_trial(*,
     # logged in the 'gostop' row alongside the go.wav play timestamp. The
     # row is appended AFTER the play so the CSV fsync never sits between
     # timestamp capture and go.wav onset.
-    play_word(words, 'ignore')
+    play_word(words, 'ignore_simple')
     pre_go_pause = 3.0 + random.uniform(-1, 1)
     time.sleep(pre_go_pause)
     go_recv_time_iso = datetime.now(timezone.utc).isoformat(
@@ -1008,7 +1009,7 @@ def main():
     # ── Pre-load WAV cues ────────────────────────────────────────────────
     words = {}
     loaded_names = []
-    for name in ['ignore', 'go', 'stop',
+    for name in ['ignore_simple', 'go', 'stop',
                  'attendlefthigh',   'attendleftlow',
                  'attendleftclick',  'attendleftbuzz',
                  'attendrighthigh',  'attendrightlow',
@@ -1026,7 +1027,7 @@ def main():
         print("  Loaded .wav files: " + ", ".join(loaded_names))
 
     # ── Summary ──────────────────────────────────────────────────────────
-    # Per-trial overhead beyond the stim blocks: preamble (ignore + nominal
+    # Per-trial overhead beyond the stim blocks: preamble (ignore_simple + nominal
     # 3 s pause + go), attention sequence (word + 0.5 s + ~1 s cue + 2 s),
     # rate-block instructions (stop + nominal 3 s pause + ratesync).
     # Operator time (rating entry, between-trial continue) is not counted.
@@ -1037,7 +1038,7 @@ def main():
                    for lg in ('left', 'right')
                    for sfx in ('high', 'low', 'click', 'buzz'))
     trial_overhead = (
-        _wav_s('ignore') + 3.0 + _wav_s('go')
+        _wav_s('ignore_simple') + 3.0 + _wav_s('go')
         + attend_s + 0.5 + 1.0 + 2.0
         + _wav_s('stop') + 3.0 + _wav_s('ratesync')
     )
@@ -1136,7 +1137,7 @@ def parse_args():
     p.add_argument('--cueblocktime',  type=float, default=20,
                    help="Duration of each cue / post-cue silent sub-block "
                         "at positions 1-2 (s).")
-    p.add_argument('--dur-s',       type=float, default=1.2,
+    p.add_argument('--dur-s',       type=float, default=1.0,
                    help="Nominal regular-cue cycle period (s). Delivered "
                         "period is counter-balanced to dur_s ± dur_s_jitter.")
     p.add_argument('--dur-s-jitter', type=float,
