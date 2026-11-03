@@ -19,10 +19,10 @@ Session structure (4 fixed trials, seated)
 ------------------------------------------
   Trial order is fixed — audio first, then vibration, slow before fast:
 
-    t1  audio      slow (+1)  'sitcountlow'    sample: A4 tone
-    t2  audio      fast (-1)  'sitcounthigh'   sample: E5 tone
-    t3  vibration  slow (+1)  'sitcountshort'  sample: effect1 (click)
-    t4  vibration  fast (-1)  'sitcountlong'   sample: effect2 (buzz)
+    t1  audio      slow (+1)  attend low   'sitcountlow'    sample: A4 tone
+    t2  audio      fast (-1)  attend high  'sitcounthigh'   sample: E5 tone
+    t3  vibration  slow (+1)  attend low   'sitcountshort'  sample: effect1 (click)
+    t4  vibration  fast (-1)  attend high  'sitcountlong'   sample: effect2 (buzz)
 
   Each trial: instruction WAV → 0.5 s → sample → 2 s → 3 sub-blocks
 
@@ -247,14 +247,18 @@ SIL_BLOCKTIME = 5
 DEFAULT_EFFECT1 = 1    # Strong Click → "low" beat
 DEFAULT_EFFECT2 = 14   # Strong Buzz   → "high" beat
 
-# Fixed trial plan: (modality, tempo, target). target selects both the
-# instruction WAV ('sitcount{target}') and the sample that follows it.
+# Fixed trial plan: (modality, tempo, attend). attend ('low' / 'high', as in
+# cue_experiment) selects the instruction WAV (SITCOUNT_WORD) and the sample
+# that follows it: A4 / E5 tone, or effect1 (click, "low") / effect2 (buzz,
+# "high").
 TRIAL_PLAN = [
     ('audio',     +1, 'low'),
     ('audio',     -1, 'high'),
-    ('vibration', +1, 'short'),
-    ('vibration', -1, 'long'),
+    ('vibration', +1, 'low'),
+    ('vibration', -1, 'high'),
 ]
+SITCOUNT_WORD = {('audio', 'low'): 'sitcountlow',       ('audio', 'high'): 'sitcounthigh',
+                 ('vibration', 'low'): 'sitcountshort', ('vibration', 'high'): 'sitcountlong'}
 
 COUNT_MAX = 50
 
@@ -437,7 +441,7 @@ class ExperimentLogger:
       - dur_s   : only for regular blocks (delivered cycle period, s)
       - tempo   : only for regular blocks (+1 = dur_s+jitter slower,
                   -1 = dur_s-jitter faster)
-      - target  : only for regular blocks ('low' / 'high' / 'short' / 'long')
+      - attend  : only for regular blocks ('low' / 'high')
       - count   : only for the count block of each trial
 
     marker_label encodes modality / block_subtype / block_position / trial_num
@@ -469,7 +473,7 @@ class ExperimentLogger:
         'recv_perf_s',
         'dur_s',
         'tempo',
-        'target',
+        'attend',
         'count',
         'marker_label',
         'rtt1_ms',
@@ -500,7 +504,7 @@ class ExperimentLogger:
     def log_block(self, *, trial_num: int, marker_label: str,
                   dur_s: float | str = '',
                   tempo: int | str = '',
-                  target: str = '',
+                  attend: str = '',
                   count: int | str = '',
                   recv_time_iso: str | None = None,
                   recv_perf_s: float | None = None):
@@ -518,7 +522,7 @@ class ExperimentLogger:
             f"{recv_perf_s:.6f}",
             dur_s,
             tempo,
-            target,
+            attend,
             count,
             marker_label,
             '', '', '', '',   # rtt1_ms, rtt2_ms, rtt3_ms, rtt_additional
@@ -543,7 +547,7 @@ class ExperimentLogger:
             trial_num,
             recv_time_iso,
             f"{recv_perf_s:.6f}",
-            '', '', '', '',      # dur_s, tempo, target, count
+            '', '', '', '',      # dur_s, tempo, attend, count
             marker_label,
             r1, r2, r3, r_add,
         ]
@@ -588,7 +592,7 @@ def run_trial(*,
               silblocktime: float,
               dur_s: float,
               tempo: int,
-              target: str,
+              attend: str,
               stim_audio: dict,
               stim_haptic: dict,
               words: dict,
@@ -597,10 +601,10 @@ def run_trial(*,
               effect2: int):
     """Run one sit-and-count trial for either modality.
 
-    Preamble : 'sitcount{target}' → 0.5 s → sample → 2 s (same timing as
-               the attention sequence in cue_experiment). Sample is the
-               A4 / E5 tone for low / high, effect1 / effect2 for
-               short / long.
+    Preamble : SITCOUNT_WORD[(modality, attend)] → 0.5 s → sample → 2 s
+               (same timing as the attention sequence in cue_experiment).
+               Sample is the A4 / E5 tone (audio) or effect1 / effect2
+               (vibration) for attend low / high.
     Blocks   : 3 sub-blocks, fixed layout:
                  p0=regular (regblocktime), p1=silent (silblocktime),
                  p2=count.
@@ -629,13 +633,13 @@ def run_trial(*,
     subtype_by_position = {0: 'reg', 1: 'sil', 2: 'cnt'}
 
     # ── Preamble: instruction + sample ───────────────────────────────────
-    play_word(words, f'sitcount{target}')
+    play_word(words, SITCOUNT_WORD[(modality, attend)])
     time.sleep(0.5)
     if is_audio:
-        play_audio(stim_audio['sample_tone_high' if target == 'high'
+        play_audio(stim_audio['sample_tone_high' if attend == 'high'
                               else 'sample_tone_low'])
     else:
-        play_haptic_event(_drv, effect1 if target == 'short' else effect2)
+        play_haptic_event(_drv, effect2 if attend == 'high' else effect1)
     time.sleep(2)
 
     # ── Run the 3 sub-blocks ─────────────────────────────────────────────
@@ -651,10 +655,10 @@ def run_trial(*,
         if subtype == 'reg':
             dur_log = f"{dur_s:.6f}"
             tempo_log = tempo
-            target_log = target
-            desc = f"regular {dur_s:.3f}s ({target})"
+            attend_log = attend
+            desc = f"regular {dur_s:.3f}s ({attend})"
         else:
-            dur_log = tempo_log = target_log = ''
+            dur_log = tempo_log = attend_log = ''
             desc = 'silent' if subtype == 'sil' else 'count'
 
         print(f"    Block {position}: {desc}")
@@ -689,7 +693,7 @@ def run_trial(*,
             marker_label=marker,
             dur_s=dur_log,
             tempo=tempo_log,
-            target=target_log,
+            attend=attend_log,
             count=count,
             recv_time_iso=block_recv_time_iso,
             recv_perf_s=block_recv_perf_s,
@@ -774,7 +778,7 @@ def main():
     # ── Pre-load WAV cues ────────────────────────────────────────────────
     words = {}
     loaded_names = []
-    for name in [f'sitcount{target}' for _, _, target in TRIAL_PLAN]:
+    for name in [SITCOUNT_WORD[(modality, attend)] for modality, _, attend in TRIAL_PLAN]:
         try:
             words[name] = load_wav(f'{name}.wav')
             loaded_names.append(name)
@@ -803,13 +807,13 @@ def main():
     # ── Trial loop ───────────────────────────────────────────────────────
     interrupted = False
     try:
-        for idx, (modality, tempo, target) in enumerate(TRIAL_PLAN):
+        for idx, (modality, tempo, attend) in enumerate(TRIAL_PLAN):
             trial_num      = idx + 1
             dur_delivered  = dur_high if tempo > 0 else dur_low
 
             print(f"\n{'─'*20}")
             print(f"  Trial {trial_num}/{total_trials}: {modality} "
-                  f"{'slow' if tempo > 0 else 'fast'} ({target})")
+                  f"{'slow' if tempo > 0 else 'fast'} ({attend})")
             print(f"{'─'*20}")
 
             t0 = perf_counter_raw()
@@ -820,7 +824,7 @@ def main():
                 silblocktime=silblocktime,
                 dur_s=dur_delivered,
                 tempo=tempo,
-                target=target,
+                attend=attend,
                 stim_audio=stim_audio,
                 stim_haptic=stim_haptic,
                 words=words,
