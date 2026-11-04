@@ -15,14 +15,23 @@ Operator console
   counted number) goes through the controlling terminal (PiTFT). An
   RF-dongle USB keyboard plugs into Pi.
 
-Session structure (4 fixed trials, seated)
-------------------------------------------
-  Trial order is fixed — audio first, then vibration, slow before fast:
+Session structure (8 trials, seated)
+------------------------------------
+  Trials come in same-modality pairs, each pair slow (+1) then fast (-1)
+  and attending both beats once. Each modality gets two pairs: the first
+  attends low → high, the second high → low, so attend x tempo is fully
+  crossed within each modality. Modality pairs alternate, A A V V A A V V
+  for an even participant ID or V V A A V V A A for an odd one
+  (build_trial_plan). Even ID:
 
     t1  audio      slow (+1)  attend low   'sitcountlow'    sample: A4 tone
     t2  audio      fast (-1)  attend high  'sitcounthigh'   sample: E5 tone
     t3  vibration  slow (+1)  attend low   'sitcountshort'  sample: effect1 (click)
     t4  vibration  fast (-1)  attend high  'sitcountlong'   sample: effect2 (buzz)
+    t5  audio      slow (+1)  attend high  'sitcounthigh'   sample: E5 tone
+    t6  audio      fast (-1)  attend low   'sitcountlow'    sample: A4 tone
+    t7  vibration  slow (+1)  attend high  'sitcountlong'   sample: effect2 (buzz)
+    t8  vibration  fast (-1)  attend low   'sitcountshort'  sample: effect1 (click)
 
   Each trial: instruction WAV → 0.5 s → sample → 2 s → 3 sub-blocks
 
@@ -54,6 +63,7 @@ Install
 import argparse
 import csv
 import os
+import random
 import time
 from datetime import datetime, timezone
 
@@ -247,20 +257,34 @@ SIL_BLOCKTIME = 5
 DEFAULT_EFFECT1 = 1    # Strong Click → "low" beat
 DEFAULT_EFFECT2 = 14   # Strong Buzz   → "high" beat
 
-# Fixed trial plan: (modality, tempo, attend). attend ('low' / 'high', as in
-# cue_experiment) selects the instruction WAV (SITCOUNT_WORD) and the sample
-# that follows it: A4 / E5 tone, or effect1 (click, "low") / effect2 (buzz,
-# "high").
-TRIAL_PLAN = [
-    ('audio',     +1, 'low'),
-    ('audio',     -1, 'high'),
-    ('vibration', +1, 'low'),
-    ('vibration', -1, 'high'),
-]
+# Each trial is (modality, tempo, attend); build_trial_plan orders them. attend
+# ('low' / 'high', as in cue_experiment) selects the instruction WAV
+# (SITCOUNT_WORD) and the sample that follows it: A4 / E5 tone, or effect1
+# (click, "low") / effect2 (buzz, "high").
 SITCOUNT_WORD = {('audio', 'low'): 'sitcountlow',       ('audio', 'high'): 'sitcounthigh',
                  ('vibration', 'low'): 'sitcountshort', ('vibration', 'high'): 'sitcountlong'}
 
 COUNT_MAX = 50
+
+
+def build_trial_plan(participant_id: str) -> list[tuple[str, int, str]]:
+    """8 trials -> [(modality, tempo, attend)] in same-modality pairs.
+
+    Each pair is slow (+1) then fast (-1). A modality's first pair attends
+    low then high, its second high then low, so attend x tempo is crossed
+    within each modality. Pairs alternate modality: audio first for an
+    even participant_id, vibration first for an odd one (a non-numeric ID
+    draws it, seeded by the ID as cue_simple_cadence.build_cadence_plan):
+    A A V V A A V V or V V A A V V A A.
+    """
+    audio_first = (int(participant_id) % 2 == 0 if participant_id.isdigit()
+                   else random.Random(f"participant::{participant_id}").random() < 0.5)
+    modalities = ('audio', 'vibration') if audio_first else ('vibration', 'audio')
+    plan = []
+    for attends in (('low', 'high'), ('high', 'low')):
+        for modality in modalities:
+            plan += [(modality, +1, attends[0]), (modality, -1, attends[1])]
+    return plan
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -752,6 +776,7 @@ def main():
 
     # ── Participant ID ───────────────────────────────────────────────────
     participant_id = get_participant_id()
+    trial_plan = build_trial_plan(participant_id)
     print(f"\nParticipant: {participant_id}")
 
     # ── Parameters ───────────────────────────────────────────────────────
@@ -778,7 +803,7 @@ def main():
     # ── Pre-load WAV cues ────────────────────────────────────────────────
     words = {}
     loaded_names = []
-    for name in [SITCOUNT_WORD[(modality, attend)] for modality, _, attend in TRIAL_PLAN]:
+    for name in dict.fromkeys(SITCOUNT_WORD[(modality, attend)] for modality, _, attend in trial_plan):
         try:
             words[name] = load_wav(f'{name}.wav')
             loaded_names.append(name)
@@ -791,10 +816,11 @@ def main():
         print("  Loaded .wav files: " + ", ".join(loaded_names))
 
     # ── Summary ──────────────────────────────────────────────────────────
-    total_trials = len(TRIAL_PLAN)
+    total_trials = len(trial_plan)
     print(f"\n{'='*20}")
     print(f"  Participant   : {participant_id}")
-    print(f"  Trials        : {total_trials}")
+    print(f"  Trials        : {total_trials}  "
+          + ", ".join(f"{m[0]}-{'slow' if t > 0 else 'fast'}-{a}" for m, t, a in trial_plan))
     print(f"  Regular period: {dur_s} s ± {dur_s_jitter} s ")
     print(f"  Blocks        : regular {regblocktime} s → silent {silblocktime} s")
     print(f"{'='*20}")
@@ -807,7 +833,7 @@ def main():
     # ── Trial loop ───────────────────────────────────────────────────────
     interrupted = False
     try:
-        for idx, (modality, tempo, attend) in enumerate(TRIAL_PLAN):
+        for idx, (modality, tempo, attend) in enumerate(trial_plan):
             trial_num      = idx + 1
             dur_delivered  = dur_high if tempo > 0 else dur_low
 
